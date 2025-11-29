@@ -585,6 +585,95 @@ def format_market_data_for_agent(market_data: Dict) -> str:
     return output
 
 
+
+def detect_institutional_levels(df: pd.DataFrame) -> Dict:
+    """
+    Detect institutional levels: Order Blocks, Fair Value Gaps (FVG), and Liquidity Pools.
+    """
+    levels = {
+        "order_blocks": [],
+        "fair_value_gaps": [],
+        "liquidity_pools": []
+    }
+    
+    if df is None or len(df) < 5:
+        return levels
+
+    # Helper to check for strong displacement (body > 1.5x average body)
+    df['body_size'] = abs(df['Close'] - df['Open'])
+    avg_body = df['body_size'].rolling(20).mean()
+    
+    for i in range(2, len(df) - 2):
+        # --- Fair Value Gaps (FVG) ---
+        # Bullish FVG: Low[i] > High[i-2]
+        if df['Low'].iloc[i] > df['High'].iloc[i-2]:
+            levels['fair_value_gaps'].append({
+                "type": "bullish",
+                "top": float(df['Low'].iloc[i]),
+                "bottom": float(df['High'].iloc[i-2]),
+                "start_date": df.index[i-2].strftime("%Y-%m-%d"),
+                "end_date": df.index[i].strftime("%Y-%m-%d")
+            })
+            
+        # Bearish FVG: High[i] < Low[i-2]
+        if df['High'].iloc[i] < df['Low'].iloc[i-2]:
+            levels['fair_value_gaps'].append({
+                "type": "bearish",
+                "top": float(df['Low'].iloc[i-2]),
+                "bottom": float(df['High'].iloc[i]),
+                "start_date": df.index[i-2].strftime("%Y-%m-%d"),
+                "end_date": df.index[i].strftime("%Y-%m-%d")
+            })
+
+        # --- Order Blocks (Simplified) ---
+        # Bullish OB: Last red candle before a strong green move
+        current_body = df['body_size'].iloc[i]
+        is_strong_move = current_body > (avg_body.iloc[i] * 1.5)
+        is_green = df['Close'].iloc[i] > df['Open'].iloc[i]
+        prev_is_red = df['Close'].iloc[i-1] < df['Open'].iloc[i-1]
+        
+        if is_strong_move and is_green and prev_is_red:
+            levels['order_blocks'].append({
+                "type": "bullish",
+                "top": float(df['High'].iloc[i-1]),
+                "bottom": float(df['Low'].iloc[i-1]),
+                "date": df.index[i-1].strftime("%Y-%m-%d")
+            })
+            
+        # Bearish OB: Last green candle before a strong red move
+        is_red = df['Close'].iloc[i] < df['Open'].iloc[i]
+        prev_is_green = df['Close'].iloc[i-1] > df['Open'].iloc[i-1]
+        
+        if is_strong_move and is_red and prev_is_green:
+            levels['order_blocks'].append({
+                "type": "bearish",
+                "top": float(df['High'].iloc[i-1]),
+                "bottom": float(df['Low'].iloc[i-1]),
+                "date": df.index[i-1].strftime("%Y-%m-%d")
+            })
+
+        # --- Liquidity Pools (Swing Highs/Lows) ---
+        # Swing High
+        if df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
+             levels['liquidity_pools'].append({
+                "type": "buy_side", # Stops above highs
+                "level": float(df['High'].iloc[i]),
+                "date": df.index[i].strftime("%Y-%m-%d")
+            })
+            
+        # Swing Low
+        if df['Low'].iloc[i] < df['Low'].iloc[i-1] and df['Low'].iloc[i] < df['Low'].iloc[i+1]:
+             levels['liquidity_pools'].append({
+                "type": "sell_side", # Stops below lows
+                "level": float(df['Low'].iloc[i]),
+                "date": df.index[i].strftime("%Y-%m-%d")
+            })
+
+    # Filter to keep only recent/relevant levels (optional optimization)
+    # For now, return all detected in the window
+    return levels
+
+
 def get_chart_data(ticker: str, period: str = "3mo", limit: int = 60) -> Dict:
     """
     Get OHLCV data with technical indicators formatted for candlestick charts.
@@ -599,6 +688,7 @@ def get_chart_data(ticker: str, period: str = "3mo", limit: int = 60) -> Dict:
         - ticker: Stock symbol
         - data: Array of OHLCV data with technical indicators
         - latest_values: Current values of all indicators
+        - institutional_levels: Detected OBs, FVGs, Liquidity
     """
     ticker = ticker.upper().strip()
     
@@ -653,6 +743,9 @@ def get_chart_data(ticker: str, period: str = "3mo", limit: int = 60) -> Dict:
         # ATR for intraday volatility gauge
         df['ATR_14'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         
+        # Detect Institutional Levels (on the full dataset to catch older levels)
+        institutional_levels = detect_institutional_levels(df)
+
         # Now limit to most recent trading days
         df = df.tail(limit)
         
@@ -710,6 +803,7 @@ def get_chart_data(ticker: str, period: str = "3mo", limit: int = 60) -> Dict:
             "ticker": ticker,
             "data": chart_data,
             "latest_values": latest_values,
+            "institutional_levels": institutional_levels,
             "data_points": len(chart_data),
             "period": period,
         }
