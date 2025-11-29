@@ -7,11 +7,41 @@ from dotenv import load_dotenv
 import json
 import asyncio
 from datetime import datetime
-from market_data import get_market_analysis, format_market_data_for_agent, get_chart_data
+from market_data import (
+    get_market_analysis,
+    format_market_data_for_agent,
+    get_chart_data,
+    run_simple_backtest,
+    get_economic_calendar,
+    get_earnings_calendar,
+    scan_chart_patterns,
+)
+from typing import List, Dict, Any
 
 # ---------- Setup ----------
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+
+def parse_ticker_list(raw: str) -> List[str]:
+    """Parse comma/space separated tickers into clean list."""
+    if not raw:
+        return []
+    parts = [p.strip().upper() for p in raw.replace("–", ",").replace("—", ",").split(",")]
+    # Also split on whitespace for cases like "TSLA NVDA"
+    tickers: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        tickers.extend([t for t in part.split() if t])
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
 
 app = FastAPI()
 
@@ -29,12 +59,13 @@ app.add_middleware(
 AGENT_PROMPTS = {
     "PLANNER": (
         "You are the PLANNER agent in a multi-agent trading system.\n"
-        "Goal: Read the user's news / headline and define a clear trading objective.\n\n"
+        "Goal: Read the user's news / headline and define a clear trading objective.\n"
+        "The user may also provide explicit tickers and a horizon; respect them and keep them in the output list.\n\n"
         "You MUST:\n"
-        "1. Extract tickers mentioned (if none, leave empty array).\n"
+        "1. Extract tickers mentioned (if none, leave empty array). If user_tickers are provided, merge them into tickers.\n"
         "2. Classify event_type (earnings, macro, guidance, product_launch, regulatory, other).\n"
         "3. Infer sentiment (bullish, bearish, mixed, unclear).\n"
-        "4. Determine intended horizon (scalp, intraday, swing, position, long_term).\n"
+        "4. Determine intended horizon (scalp, intraday, swing, position, long_term). If user_horizon provided, set horizon accordingly.\n"
         "5. Decide if this news is TRADEABLE or NOT_TRADEABLE.\n"
         "6. Summarize the thesis in plain English (what the trader is betting on).\n"
         "7. Provide explicit constraints (e.g. 'no options', 'small size', 'high risk tolerance').\n\n"
@@ -74,8 +105,8 @@ AGENT_PROMPTS = {
     ),
     "DATA_CONTEXT": (
         "You are the DATA_CONTEXT agent with access to REAL market data.\n"
-        "You will receive actual stock prices, technical indicators, fundamentals, and curated news context.\n\n"
-        "Given the planner output, NEWS agent briefing, fundamentals, and REAL MARKET DATA below, you MUST:\n"
+        "You will receive actual stock prices, technical indicators, fundamentals, curated news context, and a target_ticker.\n\n"
+        "Given the planner output, NEWS agent briefing, fundamentals, and REAL MARKET DATA below, you MUST for the target_ticker:\n"
         "1. Analyze trend using SMA/EMA/price action and cite levels.\n"
         "2. Assess momentum using the real RSI, MACD values provided.\n"
         "3. Evaluate volatility using ATR and Bollinger Bands data.\n"
@@ -100,7 +131,7 @@ AGENT_PROMPTS = {
     ),
     "STRATEGY": (
         "You are the STRATEGY agent with access to REAL technical analysis.\n"
-        "You receive planner + real market data context and design ONE clear strategy.\n"
+        "You receive planner + real market data context for a specific target_ticker and design ONE clear strategy.\n"
         "This is EDUCATIONAL ONLY – do not present as financial advice.\n\n"
         "Given the inputs with REAL technical indicators, you MUST:\n"
         "1. Choose a strategy_type (stock_momentum, stock_mean_reversion, covered_call, call_spread,\n"
@@ -127,9 +158,10 @@ AGENT_PROMPTS = {
     "RISK": (
         "You are the RISK agent.\n"
         "You only think about HOW THIS CAN GO WRONG.\n\n"
-        "Given planner + context + strategy JSON, you MUST:\n"
+        "Given planner + context + strategy JSON, and a list of upcoming_events (macro + earnings), you MUST:\n"
         "1. List at least 4 concrete risks.\n"
         "2. For each risk, propose a mitigation.\n"
+        "3. Explicitly mention if any upcoming macro/earnings events create gap/volatility risk.\n"
         "3. Rate overall risk_level: low, moderate, high, speculative.\n"
         "4. Suggest what a cautious trader might do instead (e.g., paper trade).\n\n"
         "Respond ONLY with JSON:\n"
@@ -156,9 +188,23 @@ AGENT_PROMPTS = {
         "  \"revision_instructions\": \"... or empty string if approved\"\n"
         "}"
     ),
+    "STRATEGY_FINAL": (
+        "You are the STRATEGY_FINAL agent acting as a comparator.\n"
+        "You receive multiple ticker strategies and must pick the BEST single trade for the brief horizon.\n\n"
+        "Given planner, per-ticker contexts, and strategies:\n"
+        "1. Pick best_ticker and best_strategy (one of the provided strategies).\n"
+        "2. Give 2–3 selection reasons comparing momentum, setup quality, and risk.\n"
+        "3. If no strategy is workable, set best_ticker to \"NONE\" and explain why.\n\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        "  \"best_ticker\": \"TSLA\",\n"
+        "  \"selection_reasons\": [\"...\", \"...\"],\n"
+        "  \"best_strategy\": { ...strategy schema... }\n"
+        "}"
+    ),
     "SUMMARY": (
         "You are the FINAL_SUMMARY agent.\n"
-        "You have the planner, context, final strategy, risk, and critic outputs.\n"
+        "You have the planner, multi-ticker contexts, strategies, final pick, risk, and critic outputs.\n"
         "Your job is to write a polished trading plan summary for EDUCATIONAL PURPOSES ONLY.\n\n"
         "Structure it as:\n"
         "- title\n"
@@ -167,7 +213,8 @@ AGENT_PROMPTS = {
         "- strategy\n"
         "- execution_plan\n"
         "- risk_checklist (bullet list)\n"
-        "- disclaimer (must clearly say: educational, NOT financial advice, no real-time prices).\n\n"
+        "- disclaimer (must clearly say: educational, NOT financial advice, no real-time prices).\n"
+        "- comparison_notes: short bullets comparing the tickers.\n\n"
         "Respond ONLY with JSON:\n"
         "{\n"
         "  \"title\": \"...\",\n"
@@ -176,7 +223,8 @@ AGENT_PROMPTS = {
         "  \"strategy\": \"...\",\n"
         "  \"execution_plan\": \"...\",\n"
         "  \"risk_checklist\": [\"...\", \"...\"],\n"
-        "  \"disclaimer\": \"...\"\n"
+        "  \"disclaimer\": \"...\",\n"
+        "  \"comparison_notes\": [\"...\", \"...\"]\n"
         "}"
     ),
 }
@@ -278,19 +326,27 @@ async def agent_llm_call_streaming(agent_key: str, payload: dict):
 # ---------- Pipeline Route ----------
 @app.post("/run-pipeline")
 async def run_pipeline(request: Request):
+    """
+    Non-streaming pipeline (legacy) now supports optional tickers/horizon for multi-ticker mode.
+    """
     body = await request.json()
-    headline = body.get("news_text", "").strip()
+    headline = (body.get("news_text") or "").strip()
+    user_tickers = parse_ticker_list(body.get("tickers", ""))
+    user_horizon = body.get("horizon")
 
-    if not headline:
-        raise HTTPException(status_code=400, detail="news_text is required")
+    if not headline and not user_tickers:
+        raise HTTPException(status_code=400, detail="news_text or tickers required")
+    if not headline and user_tickers:
+        headline = f"Multi-ticker analysis for: {', '.join(user_tickers)}"
 
     # This dict will store all agent outputs
     pipeline_state = {}
 
     # Shared context passed to each agent
-    # We KEEP EVERYTHING so later agents see the full story.
     shared_payload = {
         "headline": headline,
+        "user_tickers": user_tickers,
+        "user_horizon": user_horizon,
         "note": (
             "All agents are collaborating in a multi-step pipeline. "
             "This is for educational purposes only and does NOT use real-time market data."
@@ -299,99 +355,133 @@ async def run_pipeline(request: Request):
 
     try:
         # ---- 1) PLANNER ----
-        planner_input = {
-            **shared_payload,
-        }
+        planner_input = {**shared_payload}
         planner_output = await agent_llm_call("PLANNER", planner_input)
         pipeline_state["planner"] = planner_output
 
-        # If planner decides it's not tradeable, we still run others, but they will see this flag.
-        # ---- 2) DATA_CONTEXT ----
-        # Fetch real market data for the primary ticker
-        market_data = None
-        market_data_formatted = ""
-        
-        if isinstance(planner_output, dict) and planner_output.get("tickers"):
-            tickers = planner_output.get("tickers", [])
-            if tickers and len(tickers) > 0:
-                primary_ticker = tickers[0]
-                try:
-                    market_data = get_market_analysis(primary_ticker, period="3mo")
-                    market_data_formatted = format_market_data_for_agent(market_data)
-                except Exception as e:
-                    print(f"Error fetching market data for {primary_ticker}: {e}")
-                    market_data_formatted = f"Unable to fetch real market data for {primary_ticker}"
-        
-        data_input = {
+        effective_tickers = user_tickers or planner_output.get("tickers", []) if isinstance(planner_output, dict) else []
+
+        macro_events = get_economic_calendar()
+        shared_payload["upcoming_events"] = {
+            "macro": macro_events,
+            "earnings": {},
+        }
+        shared_payload["pattern_scan"] = {}
+
+        # ---- 2) DATA_CONTEXT per ticker ----
+        data_outputs = []
+        strategies = []
+
+        for ticker in effective_tickers[:3]:  # guardrail for demo
+            market_data_formatted = ""
+            fundamentals = None
+            earnings_events = []
+            patterns = []
+            try:
+                market_data = get_market_analysis(ticker, period="3mo")
+                fundamentals = market_data.get("fundamentals")
+                market_data_formatted = format_market_data_for_agent(market_data)
+                earnings_events = get_earnings_calendar(ticker)
+                patterns = scan_chart_patterns(ticker, period="6mo")
+            except Exception as e:
+                print(f"Error fetching market data for {ticker}: {e}")
+                market_data_formatted = f"Unable to fetch real market data for {ticker}"
+                earnings_events = []
+                patterns = []
+
+            shared_payload["upcoming_events"]["earnings"][ticker] = earnings_events
+            shared_payload["pattern_scan"][ticker] = patterns
+
+            data_input = {
+                **shared_payload,
+                "planner": planner_output,
+                "target_ticker": ticker,
+                "market_data": market_data_formatted,
+                "fundamentals": fundamentals,
+                "note": "Use the REAL MARKET DATA provided above to inform your analysis. Reference specific technical indicator values.",
+                "upcoming_events": shared_payload["upcoming_events"],
+                "pattern_scan": patterns,
+            }
+            data_output = await agent_llm_call("DATA_CONTEXT", data_input)
+            if isinstance(data_output, dict):
+                data_output["primary_ticker"] = ticker
+            data_outputs.append(data_output)
+
+            # ---- STRATEGY per ticker ----
+            strategy_input_v1 = {
+                **shared_payload,
+                "planner": planner_output,
+                "data_context": data_output,
+                "target_ticker": ticker,
+                "market_data": market_data_formatted,
+                "fundamentals": fundamentals,
+                "note": "Use the REAL MARKET DATA to set specific entry/exit prices, stop losses based on ATR, and reference actual technical levels.",
+                "upcoming_events": shared_payload["upcoming_events"],
+                "pattern_scan": patterns,
+            }
+            strategy_v1_output = await agent_llm_call("STRATEGY", strategy_input_v1)
+            if isinstance(strategy_v1_output, dict):
+                strategy_v1_output["ticker"] = ticker
+            strategies.append(strategy_v1_output)
+
+        pipeline_state["data_context"] = data_outputs
+        pipeline_state["strategy_v1"] = strategies
+
+        # ---- 3) PICK BEST via STRATEGY_FINAL prompt ----
+        comparator_input = {
             **shared_payload,
             "planner": planner_output,
-            "market_data": market_data_formatted,
-            "note": "Use the REAL MARKET DATA provided above to inform your analysis. Reference specific technical indicator values.",
+            "data_context_all": data_outputs,
+            "strategies": strategies,
+            "instruction": "Compare the per-ticker strategies and choose the best single trade. Return best_strategy and explain the choice.",
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
         }
-        data_output = await agent_llm_call("DATA_CONTEXT", data_input)
-        pipeline_state["data_context"] = data_output
+        strategy_final_output = await agent_llm_call("STRATEGY_FINAL", comparator_input)
+        pipeline_state["strategy_final"] = strategy_final_output
 
-        # ---- 3) STRATEGY (v1) ----
-        strategy_input_v1 = {
-            **shared_payload,
-            "planner": planner_output,
-            "data_context": data_output,
-            "market_data": market_data_formatted,
-            "note": "Use the REAL MARKET DATA to set specific entry/exit prices, stop losses based on ATR, and reference actual technical levels.",
-        }
-        strategy_v1_output = await agent_llm_call("STRATEGY", strategy_input_v1)
-        pipeline_state["strategy_v1"] = strategy_v1_output
-
-        # ---- 4) RISK ----
+        # ---- 4) RISK on best pick ----
+        best_strategy = strategy_final_output.get("best_strategy", strategy_final_output) if isinstance(strategy_final_output, dict) else {}
         risk_input = {
             **shared_payload,
             "planner": planner_output,
-            "data_context": data_output,
-            "strategy": strategy_v1_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
         }
         risk_output = await agent_llm_call("RISK", risk_input)
         pipeline_state["risk"] = risk_output
 
-        # ---- 5) CRITIC ----
+        # ---- 5) CRITIC on best pick ----
         critic_input = {
             **shared_payload,
             "planner": planner_output,
-            "data_context": data_output,
-            "strategy": strategy_v1_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
             "risk": risk_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
         }
         critic_output = await agent_llm_call("CRITIC", critic_input)
         pipeline_state["critic"] = critic_output
 
-        # ---- 6) Optional STRATEGY REVISION ----
-        strategy_final_output = strategy_v1_output
-        if isinstance(critic_output, dict) and critic_output.get("status") == "NEEDS_REVISION":
-            revision_input = {
-                **shared_payload,
-                "planner": planner_output,
-                "data_context": data_output,
-                "previous_strategy": strategy_v1_output,
-                "critic_feedback": critic_output,
-                "instruction": (
-                    "Revise the previous strategy to address ALL critiques above. "
-                    "Keep the same output JSON schema as STRATEGY."
-                ),
-            }
-            strategy_final_output = await agent_llm_call("STRATEGY", revision_input)
-
-        pipeline_state["strategy_final"] = strategy_final_output
-
-        # ---- 7) FINAL SUMMARY ----
+        # ---- 6) FINAL SUMMARY ----
         summary_input = {
             **shared_payload,
             "planner": planner_output,
-            "data_context": data_output,
+            "data_context": data_outputs,
+            "strategies": strategies,
             "strategy_final": strategy_final_output,
             "risk": risk_output,
             "critic": critic_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
         }
         summary_output = await agent_llm_call("SUMMARY", summary_input)
         pipeline_state["summary"] = summary_output
+        pipeline_state["events"] = shared_payload["upcoming_events"]
+        pipeline_state["patterns"] = shared_payload["pattern_scan"]
 
         return {
             "pipeline_state": pipeline_state,
@@ -409,20 +499,44 @@ async def run_pipeline(request: Request):
 
 # ---------- Streaming Pipeline Route (SSE) ----------
 @app.get("/stream-pipeline")
-async def stream_pipeline(news_text: str):
+async def stream_pipeline(news_text: str | None = None, request: Request = None, tickers: str | None = None, horizon: str | None = None):
     """
     Streaming version of the pipeline using Server-Sent Events (SSE).
-    Sends real-time updates as each agent processes.
+    Supports optional user-specified tickers and horizon for multi-ticker mode.
     """
-    headline = news_text.strip()
+    headline = (news_text or "").strip()
 
-    if not headline:
-        raise HTTPException(status_code=400, detail="news_text is required")
+    user_tickers = parse_ticker_list(tickers or "")
+    user_horizon = horizon.strip() if horizon else None
+
+    if not headline and not user_tickers:
+        raise HTTPException(status_code=400, detail="news_text or tickers required")
+
+    # If no headline provided, synthesize one from tickers
+    if not headline and user_tickers:
+        headline = f"Multi-ticker analysis for: {', '.join(user_tickers)}"
 
     from streaming_pipeline import stream_pipeline_events
     
+    async def event_generator():
+        try:
+            async for chunk in stream_pipeline_events(headline, user_tickers, user_horizon):
+                # Stop streaming if the client disconnects to avoid socket.send errors
+                if await request.is_disconnected():
+                    print("SSE client disconnected; stopping stream.")
+                    break
+                yield chunk
+        except asyncio.CancelledError:
+            print("SSE stream cancelled; client likely closed connection.")
+        except Exception as e:
+            err = {
+                "agent": "SYSTEM",
+                "error": f"Stream crashed: {str(e)}"
+            }
+            yield f"event: error\ndata: {json.dumps(err)}\n\n"
+    
     return StreamingResponse(
-        stream_pipeline_events(headline),
+        event_generator(),
         media_type="text/event-stream"
     )
 
@@ -465,6 +579,33 @@ async def get_chart_data_endpoint(ticker: str, period: str = "3mo", limit: int =
         return chart_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch chart data: {str(e)}")
+
+
+# ---------- Backtesting Endpoint ----------
+@app.post("/backtest")
+async def backtest_strategy(request: Request):
+    """
+    Simple historical backtest placeholder.
+    Input JSON: { "ticker": "AAPL", "start": "2022-01-01", "end": "2024-01-01", "strategy": {...optional...} }
+    """
+    body = await request.json()
+    ticker = (body.get("ticker") or "").strip().upper()
+    start = (body.get("start") or "2022-01-01").strip()
+    end = (body.get("end") or datetime.now().strftime("%Y-%m-%d")).strip()
+    strategy = body.get("strategy")
+
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+
+    try:
+        result = run_simple_backtest(ticker, start, end, strategy)
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}")
 
 # ---------- Run locally ----------
 # uvicorn main:app --reload --port 8000

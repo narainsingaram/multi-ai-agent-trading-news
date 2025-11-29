@@ -16,7 +16,7 @@ if not hasattr(np, 'NaN'):
 
 import pandas_ta as ta
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -204,6 +204,74 @@ def get_historical_data(ticker: str, period: str = "3mo") -> Optional[pd.DataFra
     except Exception as e:
         print(f"Error fetching historical data for {ticker}: {e}")
         return None
+
+
+def get_historical_range(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """
+    Get historical OHLCV data for a date range using yfinance.
+    Dates are YYYY-MM-DD strings.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(start=start, end=end)
+        if df.empty:
+            return None
+        return df
+    except Exception as e:
+        print(f"Error fetching range data for {ticker}: {e}")
+        return None
+
+
+def get_economic_calendar() -> List[Dict]:
+    """
+    Lightweight static macro calendar for demo purposes.
+    In production, replace with live data source.
+    """
+    today = datetime.today()
+    base_year = today.year
+    return [
+        {"event": "CPI", "date": f"{base_year}-12-12", "risk": "High volatility around release"},
+        {"event": "FOMC Rate Decision", "date": f"{base_year}-12-18", "risk": "Policy shift risk"},
+        {"event": "Non-Farm Payrolls", "date": f"{base_year}-12-06", "risk": "Jobs print can swing risk assets"},
+        {"event": "Fed Chair Speech", "date": f"{base_year}-11-30", "risk": "Forward-guidance sensitivity"},
+    ]
+
+
+def get_earnings_calendar(ticker: str) -> List[Dict]:
+    """
+    Try to fetch upcoming earnings from yfinance calendar.
+    Falls back to empty list if unavailable.
+    """
+    events: List[Dict] = []
+    try:
+        stock = yf.Ticker(ticker)
+        cal = getattr(stock, "calendar", None)
+        if cal is not None and not cal.empty:
+            # yfinance calendar is a DataFrame with index as events
+            for idx, row in cal.iterrows():
+                dt = row.iloc[0]
+                if isinstance(dt, (pd.Timestamp, datetime)):
+                    date_str = dt.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(dt)
+                events.append({
+                    "event": idx,
+                    "date": date_str,
+                    "risk": "Earnings catalyst"
+                })
+    except Exception as e:
+        print(f"Error fetching earnings calendar for {ticker}: {e}")
+
+    # Deduplicate and keep short list
+    seen = set()
+    deduped = []
+    for ev in events:
+        key = (ev["event"], ev["date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ev)
+    return deduped[:3]
 
 
 def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
@@ -652,3 +720,129 @@ def get_chart_data(ticker: str, period: str = "3mo", limit: int = 60) -> Dict:
             "error": f"Failed to generate chart data: {str(e)}",
             "ticker": ticker,
         }
+
+
+def run_simple_backtest(ticker: str, start: str, end: str, strategy: Optional[Dict] = None) -> Dict:
+    """
+    Lightweight backtest placeholder.
+    - Buys at first close in range, holds until end.
+    - Computes ROI, CAGR, win rate (positive days), max drawdown, Sharpe (daily, 0% rf).
+    """
+    df = get_historical_range(ticker, start, end)
+    if df is None or df.empty:
+        return {"error": f"No historical data for {ticker} in range {start} to {end}"}
+
+    df = df.copy()
+    df["pct_return"] = df["Close"].pct_change()
+    df.dropna(inplace=True)
+    if df.empty:
+        return {"error": "Not enough data to backtest"}
+
+    start_price = df["Close"].iloc[0]
+    end_price = df["Close"].iloc[-1]
+    roi = (end_price / start_price) - 1
+
+    # CAGR approximation
+    days = (df.index[-1] - df.index[0]).days or 1
+    years = days / 365.25
+    cagr = (end_price / start_price) ** (1 / years) - 1 if years > 0 else roi
+
+    # Win rate: percent of positive daily returns
+    win_rate = (df["pct_return"] > 0).mean()
+
+    # Max drawdown
+    cumulative = (1 + df["pct_return"]).cumprod()
+    rolling_max = cumulative.cummax()
+    drawdowns = (cumulative - rolling_max) / rolling_max
+    max_drawdown = drawdowns.min()
+
+    # Sharpe (daily)
+    avg_daily = df["pct_return"].mean()
+    std_daily = df["pct_return"].std()
+    sharpe = (avg_daily / std_daily * (252 ** 0.5)) if std_daily and std_daily != 0 else None
+
+    return {
+        "ticker": ticker.upper(),
+        "start": start,
+        "end": end,
+        "roi": roi,
+        "cagr": cagr,
+        "win_rate": win_rate,
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "bars": len(df),
+        "strategy_echo": strategy or {},
+    }
+
+
+def scan_chart_patterns(ticker: str, period: str = "6mo") -> List[Dict]:
+    """
+    Lightweight heuristic pattern scanner. Returns list of {pattern, confidence, detail}.
+    Not a production-grade scanner; meant to inform the LLM and UI.
+    """
+    try:
+        df = get_historical_data(ticker, period)
+        if df is None or df.empty:
+            return []
+        closes = df["Close"].tolist()
+        highs = df["High"].tolist()
+        lows = df["Low"].tolist()
+        patterns: List[Dict] = []
+
+        def add(pattern, conf, detail):
+            patterns.append({"pattern": pattern, "confidence": conf, "detail": detail})
+
+        n = len(closes)
+        if n < 30:
+            return patterns
+
+        # Bull flag: strong advance then tight range
+        rally = (closes[-10] - closes[-20]) / closes[-20] if closes[-20] else 0
+        flag_range = (max(closes[-5:]) - min(closes[-5:])) / closes[-5]
+        if rally > 0.07 and flag_range < 0.03:
+            add("Bull flag", round(min(0.9, rally + 0.5 - flag_range), 2), "Advance over last 20 bars with tight 5-bar consolidation.")
+
+        # Double top: two recent highs within 2% separated by 5-20 bars
+        recent_highs = sorted([(h, i) for i, h in enumerate(highs[-40:])], key=lambda x: x[0], reverse=True)
+        if len(recent_highs) >= 2:
+            h1, i1 = recent_highs[0]
+            h2, i2 = next(((h, i) for h, i in recent_highs[1:] if abs(h - h1) / h1 < 0.02 and abs(i - i1) >= 5), (None, None))
+            if h2:
+                add("Double top", 0.62, f"Two swing highs within 2% at bars {n-40+i1} and {n-40+i2}.")
+
+        # Cup & handle: rounded base then small pullback
+        window = closes[-60:]
+        if len(window) >= 40:
+            left = window[0]
+            right = window[-1]
+            mid = min(window)
+            if abs(left - right) / left < 0.03 and (left - mid) / left > 0.08:
+                handle_drop = (max(window[-5:]) - min(window[-5:])) / max(window[-5:])
+                if handle_drop < 0.04:
+                    add("Cup & handle", 0.58, "Rounded base with shallow handle in last 5 bars.")
+
+        # Rising wedge: higher highs/lows with contracting range
+        hh_slope = (highs[-1] - highs[-15]) / highs[-15] if highs[-15] else 0
+        ll_slope = (lows[-1] - lows[-15]) / lows[-15] if lows[-15] else 0
+        range_now = (highs[-1] - lows[-1]) / highs[-1]
+        range_then = (highs[-15] - lows[-15]) / highs[-15]
+        if hh_slope > 0 and ll_slope > 0 and hh_slope < ll_slope and range_now < range_then:
+            add("Rising wedge", 0.55, "Higher highs/lows with contracting range over last 15 bars.")
+
+        # Fair value gap (ICT): identify recent 3-candle gap
+        for i in range(n - 10, n - 2):
+            if lows[i] > highs[i - 2]:
+                gap = (lows[i] - highs[i - 2]) / highs[i - 2]
+                if gap > 0.01:
+                    add("Bullish fair value gap", round(min(0.9, 0.5 + gap), 2), f"Gap of {gap*100:.1f}% between bars {i-2} and {i}.")
+                    break
+            if highs[i] < lows[i - 2]:
+                gap = (lows[i - 2] - highs[i]) / lows[i - 2]
+                if gap > 0.01:
+                    add("Bearish fair value gap", round(min(0.9, 0.5 + gap), 2), f"Gap of {gap*100:.1f}% between bars {i-2} and {i}.")
+                    break
+
+        return patterns[:6]
+    except Exception as e:
+        print(f"Pattern scan failed for {ticker}: {e}")
+        return []
