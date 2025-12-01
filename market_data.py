@@ -245,20 +245,54 @@ def get_earnings_calendar(ticker: str) -> List[Dict]:
     events: List[Dict] = []
     try:
         stock = yf.Ticker(ticker)
-        cal = getattr(stock, "calendar", None)
-        if cal is not None and not cal.empty:
-            # yfinance calendar is a DataFrame with index as events
-            for idx, row in cal.iterrows():
-                dt = row.iloc[0]
-                if isinstance(dt, (pd.Timestamp, datetime)):
-                    date_str = dt.strftime("%Y-%m-%d")
-                else:
-                    date_str = str(dt)
+        # Helper to normalize different calendar formats
+        def _normalize_event_date(value):
+            if isinstance(value, (pd.Timestamp, datetime)):
+                return value.strftime("%Y-%m-%d")
+            if hasattr(value, "to_pydatetime"):
+                return value.to_pydatetime().strftime("%Y-%m-%d")
+            if isinstance(value, (list, tuple, pd.Series)):
+                for item in value:
+                    normalized = _normalize_event_date(item)
+                    if normalized:
+                        return normalized
+                return None
+            if value is None:
+                return None
+            try:
+                if pd.isna(value):
+                    return None
+            except Exception:
+                pass
+            return str(value)
+
+        def _add_event(event_name: str, raw_date):
+            date_str = _normalize_event_date(raw_date)
+            if date_str:
                 events.append({
-                    "event": idx,
+                    "event": event_name,
                     "date": date_str,
                     "risk": "Earnings catalyst"
                 })
+
+        # Preferred: use get_earnings_dates if available (yfinance >=0.2.40)
+        get_dates = getattr(stock, "get_earnings_dates", None)
+        if callable(get_dates):
+            dates_df = get_dates(limit=4)
+            if isinstance(dates_df, pd.DataFrame) and not dates_df.empty:
+                for idx, _row in dates_df.iterrows():
+                    _add_event("Earnings Date", idx)
+
+        # Fallback: older calendar attribute (DataFrame or dict)
+        if not events:
+            cal = getattr(stock, "calendar", None)
+            if isinstance(cal, pd.DataFrame):
+                for idx, row in cal.iterrows():
+                    value = row.iloc[0] if len(row) else None
+                    _add_event(idx, value)
+            elif isinstance(cal, dict):
+                for key, value in cal.items():
+                    _add_event(str(key), value)
     except Exception as e:
         print(f"Error fetching earnings calendar for {ticker}: {e}")
 

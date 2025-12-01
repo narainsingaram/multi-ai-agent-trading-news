@@ -228,6 +228,14 @@ AGENT_PROMPTS = {
         "  \"comparison_notes\": [\"...\", \"...\"]\n"
         "}"
     ),
+    "WOLF": (
+        "You are Sigma Wolf, a friendly and concise trading assistant. "
+        "Answer the user's question based on the provided analysis context. "
+        "Use the planner, data_context, strategies, and summary to give helpful explanations. "
+        "Keep your answers under 3 sentences and conversational. "
+        "If you don't have enough information, just say so briefly. "
+        "This is for educational purposes only, not financial advice."
+    ),
 }
 
 # ---------- Core LLM Call ----------
@@ -235,8 +243,8 @@ async def agent_llm_call(agent_key: str, payload: dict):
     """
     Generic helper that:
     - Sends a system prompt + JSON payload to the model
-    - Forces JSON output via response_format
-    - Parses JSON on the backend
+    - Forces JSON output via response_format (except for WOLF)
+    - Parses JSON on the backend (or returns plain text for WOLF)
     """
     system_prompt = AGENT_PROMPTS[agent_key]
 
@@ -249,15 +257,25 @@ async def agent_llm_call(agent_key: str, payload: dict):
     ]
 
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1024,
-            response_format={"type": "json_object"},
-        )
-        response_content = completion.choices[0].message.content
-        return json.loads(response_content)
+        # WOLF agent returns plain text, others return JSON
+        if agent_key == "WOLF":
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300,
+            )
+            return completion.choices[0].message.content.strip()
+        else:
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+            response_content = completion.choices[0].message.content
+            return json.loads(response_content)
     except json.JSONDecodeError:
         return {
             "error": "JSONDecodeError",
@@ -268,7 +286,6 @@ async def agent_llm_call(agent_key: str, payload: dict):
             "error": "APIError",
             "message": str(e)
         }
-
 
 async def agent_llm_call_streaming(agent_key: str, payload: dict):
     """
@@ -590,6 +607,38 @@ async def get_chart_data_endpoint(ticker: str, period: str = "3mo", limit: int =
         return chart_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch chart data: {str(e)}")
+
+# ---------- Sigma Wolf Chat Endpoint ----------
+@app.post("/wolf-chat")
+async def wolf_chat(request: Request):
+    """
+    Lightweight helper to answer questions via Sigma Wolf using existing pipeline context.
+    Input JSON:
+    {
+      "question": "...",
+      "pipeline": { ... optional pipeline state ... }
+    }
+    """
+    body = await request.json()
+    question = (body.get("question") or "").strip()
+    pipeline = body.get("pipeline") or {}
+
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    payload = {
+        "question": question,
+        "planner": pipeline.get("planner"),
+        "data_context": pipeline.get("data_context"),
+        "strategies": pipeline.get("strategy_v1") or pipeline.get("strategies"),
+        "summary": pipeline.get("summary"),
+        "strategy_final": pipeline.get("strategy_final"),
+    }
+    try:
+        reply = await agent_llm_call("WOLF", payload)
+        return {"answer": reply}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Wolf chat failed: {str(e)}")
 
 
 # ---------- Backtesting Endpoint ----------
