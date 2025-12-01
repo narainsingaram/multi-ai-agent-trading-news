@@ -405,6 +405,16 @@ async def run_pipeline(request: Request):
             data_output = await agent_llm_call("DATA_CONTEXT", data_input)
             if isinstance(data_output, dict):
                 data_output["primary_ticker"] = ticker
+                
+                # Inject Chart Data & Institutional Levels
+                try:
+                    chart_result = get_chart_data(ticker, period="6mo")
+                    if "error" not in chart_result:
+                        data_output["chart_data"] = chart_result.get("data", [])
+                        data_output["institutional_levels"] = chart_result.get("institutional_levels", {})
+                except Exception as e:
+                    print(f"Error injecting chart data for {ticker}: {e}")
+
             data_outputs.append(data_output)
 
             # ---- STRATEGY per ticker ----
@@ -606,6 +616,31 @@ async def backtest_strategy(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}")
+
+
+# ---------- Ticker Extraction Endpoint ----------
+@app.post("/extract-tickers")
+async def extract_tickers_endpoint(request: Request):
+    """
+    Extract stock ticker symbols from natural language text using AI.
+    
+    Input JSON: { "text": "What's happening with Apple and Tesla?" }
+    Returns: { "tickers": ["AAPL", "TSLA"] }
+    """
+    from ticker_extractor import extract_tickers
+    
+    body = await request.json()
+    text = body.get("text", "").strip()
+    
+    if not text:
+        return {"tickers": []}
+    
+    try:
+        tickers = extract_tickers(text)
+        return {"tickers": tickers}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ticker extraction failed: {str(e)}")
+
 
 # ---------- Run locally ----------
 # uvicorn main:app --reload --port 8000
