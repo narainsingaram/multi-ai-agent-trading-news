@@ -821,6 +821,7 @@ def run_simple_backtest(ticker: str, start: str, end: str, strategy: Optional[Di
     Lightweight backtest placeholder.
     - Buys at first close in range, holds until end.
     - Computes ROI, CAGR, win rate (positive days), max drawdown, Sharpe (daily, 0% rf).
+    - Returns equity curve and drawdown series for charting.
     """
     df = get_historical_range(ticker, start, end)
     if df is None or df.empty:
@@ -844,11 +845,19 @@ def run_simple_backtest(ticker: str, start: str, end: str, strategy: Optional[Di
     # Win rate: percent of positive daily returns
     win_rate = (df["pct_return"] > 0).mean()
 
-    # Max drawdown
+    # Max drawdown + equity curve
     cumulative = (1 + df["pct_return"]).cumprod()
     rolling_max = cumulative.cummax()
     drawdowns = (cumulative - rolling_max) / rolling_max
     max_drawdown = drawdowns.min()
+
+    equity_curve = []
+    for idx, (ts, eq, dd) in enumerate(zip(df.index, cumulative, drawdowns)):
+        equity_curve.append({
+            "date": ts.strftime("%Y-%m-%d"),
+            "equity": float(eq),
+            "drawdown": float(dd)
+        })
 
     # Sharpe (daily)
     avg_daily = df["pct_return"].mean()
@@ -865,6 +874,7 @@ def run_simple_backtest(ticker: str, start: str, end: str, strategy: Optional[Di
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
         "bars": len(df),
+        "equity_curve": equity_curve,
         "strategy_echo": strategy or {},
     }
 

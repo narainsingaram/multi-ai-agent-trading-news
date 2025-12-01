@@ -139,8 +139,9 @@ AGENT_PROMPTS = {
         "2. Describe entry_logic using SPECIFIC price levels from the real data (e.g., 'enter if price breaks above $150 with RSI > 50').\n"
         "3. Describe exit_logic with ACTUAL support/resistance levels (e.g., 'take profit at $160, stop loss at $145').\n"
         "4. Define risk_management using real ATR for stop placement.\n"
-        "5. Reference the actual RSI, MACD, Bollinger Bands in your strategy logic.\n"
-        "6. Add 2–3 implementation_notes based on current volatility and volume.\n\n"
+        "5. Explicitly reference MULTIPLE technical confluences available in data_context: RSI, MACD (and histogram), EMA/SMA stack, VWAP, Bollinger position, ATR, volume vs average, Stochastic %K/%D, OBV/MFI flow, and any pattern_scan levels. Do NOT rely on just RSI/MACD.\n"
+        "6. Use institutional/pattern levels if provided (support/resistance, order blocks, liquidity pools) when setting entries/stops/targets.\n"
+        "7. Add 2–3 implementation_notes based on volatility regime and volume/flow context.\n\n"
         "Respond ONLY with JSON:\n"
         "{\n"
         "  \"strategy_type\": \"...\",\n"
@@ -193,7 +194,7 @@ AGENT_PROMPTS = {
         "You receive multiple ticker strategies and must pick the BEST single trade for the brief horizon.\n\n"
         "Given planner, per-ticker contexts, and strategies:\n"
         "1. Pick best_ticker and best_strategy (one of the provided strategies).\n"
-        "2. Give 2–3 selection reasons comparing momentum, setup quality, and risk.\n"
+        "2. Give 2–3 selection reasons comparing momentum, setup quality, and risk, and explicitly mention technical confluences (EMA/VWAP/RSI/MACD/ATR/volume/OBV/Stoch/patterns) that drove the choice.\n"
         "3. If no strategy is workable, set best_ticker to \"NONE\" and explain why.\n\n"
         "Respond ONLY with JSON:\n"
         "{\n"
@@ -210,7 +211,7 @@ AGENT_PROMPTS = {
         "- title\n"
         "- thesis\n"
         "- market_context\n"
-        "- strategy\n"
+        "- strategy (include key technical confluences: EMA/SMA stack, RSI/MACD, VWAP, volume/OBV/MFI, Stoch, ATR, Bollinger, notable patterns/levels)\n"
         "- execution_plan\n"
         "- risk_checklist (bullet list)\n"
         "- disclaimer (must clearly say: educational, NOT financial advice, no real-time prices).\n"
@@ -640,6 +641,204 @@ async def extract_tickers_endpoint(request: Request):
         return {"tickers": tickers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ticker extraction failed: {str(e)}")
+
+
+# ---------- Analysis Storage (In-Memory for Demo) ----------
+# In production, replace with database (PostgreSQL, MongoDB, etc.)
+analysis_storage: Dict[str, Dict[str, Any]] = {}
+
+def generate_analysis_id() -> str:
+    """Generate a unique ID for saved analyses."""
+    import uuid
+    return str(uuid.uuid4())[:8]  # Short ID for easy sharing
+
+@app.post("/save-analysis")
+async def save_analysis(request: Request):
+    """
+    Save an analysis with auto-generated ID.
+    
+    Input JSON: {
+        "query": "...",
+        "pipeline": {...},
+        "summary": {...},
+        "dataContext": {...},
+        "tickers": ["AAPL", "TSLA"],
+        "horizon": "swing"
+    }
+    
+    Returns: { "analysis_id": "abc123", "url": "http://..." }
+    """
+    body = await request.json()
+    
+    analysis_id = generate_analysis_id()
+    timestamp = datetime.now().isoformat()
+    
+    # Store the complete analysis
+    analysis_storage[analysis_id] = {
+        "id": analysis_id,
+        "timestamp": timestamp,
+        "query": body.get("query", ""),
+        "pipeline": body.get("pipeline", {}),
+        "summary": body.get("summary"),
+        "dataContext": body.get("dataContext"),
+        "tickers": body.get("tickers", []),
+        "horizon": body.get("horizon", "auto"),
+    }
+    
+    # Generate shareable URL (adjust domain for production)
+    share_url = f"http://localhost:3000?analysis={analysis_id}"
+    
+    return {
+        "analysis_id": analysis_id,
+        "url": share_url,
+        "timestamp": timestamp
+    }
+
+@app.get("/analysis/{analysis_id}")
+async def get_analysis(analysis_id: str):
+    """
+    Retrieve a saved analysis by ID.
+    
+    Returns the complete analysis data or 404 if not found.
+    """
+    if analysis_id not in analysis_storage:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    
+    return analysis_storage[analysis_id]
+
+@app.get("/analysis/history")
+async def get_analysis_history():
+    """
+    Get list of all saved analyses (metadata only).
+    
+    Returns: [
+        {
+            "id": "abc123",
+            "timestamp": "2024-01-01T12:00:00",
+            "query": "...",
+            "tickers": ["AAPL"],
+            "horizon": "swing"
+        },
+        ...
+    ]
+    """
+    # Return metadata only (not full pipeline data)
+    history = [
+        {
+            "id": item["id"],
+            "timestamp": item["timestamp"],
+            "query": item["query"],
+            "tickers": item["tickers"],
+            "horizon": item["horizon"],
+            "sentiment": item.get("pipeline", {}).get("planner", {}).get("sentiment", "unknown")
+        }
+        for item in analysis_storage.values()
+    ]
+    
+    # Sort by timestamp descending (newest first)
+    history.sort(key=lambda x: x["timestamp"], reverse=True)
+    
+    return {"history": history, "count": len(history)}
+
+@app.delete("/analysis/{analysis_id}")
+async def delete_analysis(analysis_id: str):
+    """
+    Delete a saved analysis.
+    
+    Returns: { "success": true, "message": "..." }
+    """
+    if analysis_id not in analysis_storage:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    
+    del analysis_storage[analysis_id]
+    
+    return {
+        "success": True,
+        "message": f"Analysis {analysis_id} deleted successfully"
+    }
+
+
+# ---------- Options Chain Endpoint ----------
+@app.get("/options/{ticker}")
+async def get_options_chain_endpoint(ticker: str, expiration: str | None = None):
+    """
+    Get real options chain data for a ticker.
+    
+    Args:
+        ticker: Stock symbol (e.g., AAPL, TSLA)
+        expiration: Optional expiration date (YYYY-MM-DD)
+    
+    Returns:
+        Options chain with calls, puts, put/call ratios, unusual activity, and heatmap
+    """
+    from options_data import get_options_chain
+    
+    try:
+        options_data = get_options_chain(ticker.upper(), expiration)
+        
+        if "error" in options_data:
+            raise HTTPException(status_code=400, detail=options_data["error"])
+        
+        return options_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch options data: {str(e)}")
+
+
+# ---------- Social Sentiment Endpoints ----------
+@app.get("/sentiment/trending")
+async def get_trending_sentiment(limit: int = 20):
+    """
+    Get trending stocks from Reddit with sentiment analysis.
+    
+    Args:
+        limit: Number of trending tickers to return (default: 20)
+    
+    Returns:
+        Trending tickers with mention counts, sentiment scores, and discussion highlights
+    """
+    from sentiment_data import get_trending_stocks
+    
+    try:
+        sentiment_data = get_trending_stocks(limit=limit)
+        
+        if "error" in sentiment_data:
+            raise HTTPException(status_code=400, detail=sentiment_data["error"])
+        
+        return sentiment_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sentiment data: {str(e)}")
+
+
+@app.get("/sentiment/{ticker}")
+async def get_ticker_sentiment_endpoint(ticker: str):
+    """
+    Get detailed sentiment analysis for a specific ticker.
+    
+    Args:
+        ticker: Stock symbol (e.g., AAPL, TSLA)
+    
+    Returns:
+        Sentiment score, discussions, and sentiment distribution
+    """
+    from sentiment_data import get_ticker_sentiment
+    
+    try:
+        sentiment_data = get_ticker_sentiment(ticker.upper())
+        
+        if "error" in sentiment_data and sentiment_data.get("mention_count", 0) == 0:
+            # Return empty data instead of error for no mentions
+            return sentiment_data
+        
+        return sentiment_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch ticker sentiment: {str(e)}")
+
+
+
 
 
 # ---------- Run locally ----------

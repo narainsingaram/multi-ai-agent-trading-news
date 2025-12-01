@@ -217,6 +217,7 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
                 "fundamentals": bundle["fundamentals"],
                 "news_briefing": news_output,
                 "upcoming_events": shared_payload["upcoming_events"],
+                "pattern_scan": bundle.get("patterns"),
             }
             strategy_output = None
             
