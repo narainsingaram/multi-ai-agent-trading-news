@@ -15,6 +15,7 @@ from market_data import (
     get_economic_calendar,
     get_earnings_calendar,
     scan_chart_patterns,
+    scan_market_for_criteria,
 )
 from typing import List, Dict, Any
 
@@ -666,6 +667,30 @@ async def backtest_strategy(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}")
+
+
+@app.post("/scan-market")
+async def scan_market(request: Request):
+    """
+    Market scanner endpoint.
+    Input JSON: { "query": "RSI < 30 and positive sentiment", "universe": [...optional...], "limit": 40 }
+    """
+    body = await request.json()
+    query = (body.get("query") or "").strip()
+    universe = body.get("universe")
+    limit = body.get("limit", 40)
+
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required for market scans")
+
+    try:
+        tickers = universe if isinstance(universe, list) else None
+        result = scan_market_for_criteria(query, universe=tickers, limit=int(limit))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Market scan failed: {str(e)}")
 
 
 # ---------- Ticker Extraction Endpoint ----------

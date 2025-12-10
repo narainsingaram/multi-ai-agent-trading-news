@@ -5,6 +5,7 @@ Uses Finnhub API for real-time quotes and yfinance for historical data.
 """
 
 import os
+import re
 import yfinance as yf
 import finnhub
 import pandas as pd
@@ -16,7 +17,7 @@ if not hasattr(np, 'NaN'):
 
 import pandas_ta as ta
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Callable, Dict, Optional, List, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +28,15 @@ finnhub_client = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
 # Cache to avoid excessive API calls
 _cache = {}
 _cache_timeout = 300  # 5 minutes
+
+# Lightweight universe for market scans (large caps + liquid growth names)
+SCAN_UNIVERSE = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO", "NFLX",
+    "QCOM", "CRM", "ORCL", "ADBE", "INTC", "CSCO", "IBM", "SHOP", "UBER", "PYPL",
+    "SQ", "PLTR", "SNOW", "MU", "TXN", "AMAT", "COST", "WMT", "TGT", "KO", "PEP",
+    "NKE", "DIS", "JPM", "BAC", "GS", "MS", "UNH", "LLY", "PFE", "CVX", "XOM",
+    "BA", "GE", "CAT", "HON", "DE", "RTX", "PANW", "NET", "ZS", "OKTA"
+]
 
 
 def get_stock_quote(ticker: str) -> Optional[Dict]:
@@ -306,6 +316,222 @@ def get_earnings_calendar(ticker: str) -> List[Dict]:
         seen.add(key)
         deduped.append(ev)
     return deduped[:3]
+
+
+def _parse_scan_filters(query: str) -> Tuple[List[Callable[[Dict[str, Any]], Tuple[bool, str]]], List[str], bool, Tuple[str, str]]:
+    """
+    Parse a natural language scan query into simple predicate functions.
+    
+    Returns:
+        filters: list of callables returning (bool passed, reason)
+        labels: human-readable labels for filters
+        requires_sentiment: whether we need to fetch sentiment data
+        sort_hint: (field, direction) to prioritize results
+    """
+    text = (query or "").lower()
+    filters: List[Callable[[Dict[str, Any]], Tuple[bool, str]]] = []
+    labels: List[str] = []
+    requires_sentiment = False
+    sort_hint: Tuple[str, str] = ("score", "desc")
+
+    for op, threshold_str in re.findall(r"rsi\s*(<=|<|>=|>)\s*(\d+)", text):
+        threshold = float(threshold_str)
+
+        def rsi_filter(data: Dict[str, Any], th=threshold, operator=op):
+            rsi_val = data.get("rsi")
+            if rsi_val is None:
+                return False, "RSI unavailable"
+            if operator in ("<", "<="):
+                passed = rsi_val <= th if operator == "<=" else rsi_val < th
+            else:
+                passed = rsi_val >= th if operator == ">=" else rsi_val > th
+            return passed, f"RSI {operator} {th}"
+
+        filters.append(rsi_filter)
+        labels.append(f"RSI {op} {threshold}")
+        sort_hint = ("rsi", "asc" if op in ("<", "<=") else "desc")
+
+    if "oversold" in text and not any("RSI" in lbl for lbl in labels):
+        def oversold_filter(data: Dict[str, Any]):
+            rsi_val = data.get("rsi")
+            if rsi_val is None:
+                return False, "RSI unavailable"
+            return rsi_val <= 35, "RSI <= 35 (oversold)"
+        filters.append(oversold_filter)
+        labels.append("RSI <= 35 (oversold)")
+        sort_hint = ("rsi", "asc")
+
+    if "overbought" in text and not any("RSI" in lbl for lbl in labels):
+        def overbought_filter(data: Dict[str, Any]):
+            rsi_val = data.get("rsi")
+            if rsi_val is None:
+                return False, "RSI unavailable"
+            return rsi_val >= 65, "RSI >= 65 (overbought)"
+        filters.append(overbought_filter)
+        labels.append("RSI >= 65 (overbought)")
+        sort_hint = ("rsi", "desc")
+
+    if "positive sentiment" in text or "bullish sentiment" in text or "positive social" in text:
+        requires_sentiment = True
+
+        def bullish_sentiment(data: Dict[str, Any]):
+            score = data.get("sentiment_score")
+            if score is None:
+                return False, "Sentiment unavailable"
+            return score > 0.05, f"Sentiment {score:.2f} bullish"
+
+        filters.append(bullish_sentiment)
+        labels.append("Sentiment > 0")
+        sort_hint = ("sentiment_score", "desc")
+
+    if "negative sentiment" in text or "bearish sentiment" in text:
+        requires_sentiment = True
+
+        def bearish_sentiment(data: Dict[str, Any]):
+            score = data.get("sentiment_score")
+            if score is None:
+                return False, "Sentiment unavailable"
+            return score < -0.05, f"Sentiment {score:.2f} bearish"
+
+        filters.append(bearish_sentiment)
+        labels.append("Sentiment < 0")
+        sort_hint = ("sentiment_score", "asc")
+
+    return filters, labels, requires_sentiment, sort_hint
+
+
+def _build_scan_snapshot(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Lightweight snapshot used for market scans.
+    Avoids heavy quote APIs to keep scans fast.
+    """
+    hist_data = get_historical_data(ticker, "6mo")
+    if hist_data is None or hist_data.empty:
+        return None
+
+    technicals = calculate_technical_indicators(hist_data)
+    if not technicals:
+        return None
+
+    latest_close = float(hist_data["Close"].iloc[-1])
+    returns_1d = ((hist_data['Close'].iloc[-1] / hist_data['Close'].iloc[-2]) - 1) * 100 if len(hist_data) > 1 else 0.0
+    returns_5d = ((hist_data['Close'].iloc[-1] / hist_data['Close'].iloc[-5]) - 1) * 100 if len(hist_data) > 5 else 0.0
+
+    fundamentals = get_fundamentals(ticker) or {}
+    company_name = None
+    try:
+        info = yf.Ticker(ticker).info or {}
+        company_name = info.get("shortName") or info.get("longName")
+    except Exception:
+        company_name = None
+
+    momentum = technicals.get("momentum", {})
+    volume = technicals.get("volume", {})
+    trend = technicals.get("trend", {})
+    volatility = technicals.get("volatility", {})
+
+    return {
+        "ticker": ticker,
+        "name": company_name,
+        "price": round(latest_close, 2),
+        "rsi": momentum.get("rsi_14"),
+        "macd": momentum.get("macd"),
+        "trend": trend.get("direction"),
+        "volume_trend": volume.get("volume_trend"),
+        "returns_1d": round(returns_1d, 2),
+        "returns_5d": round(returns_5d, 2),
+        "bb_position": volatility.get("bb_position"),
+        "atr": volatility.get("atr_14"),
+        "market_cap": fundamentals.get("market_cap"),
+    }
+
+
+def scan_market_for_criteria(query: str, universe: Optional[List[str]] = None, limit: int = 40) -> Dict[str, Any]:
+    """
+    Scan a curated ticker universe and return matches for the user's criteria.
+    
+    Args:
+        query: Natural language criteria (e.g., "RSI < 30 and positive sentiment")
+        universe: Optional list of tickers to scan
+        limit: Max tickers to evaluate
+    """
+    tickers = list(dict.fromkeys(universe or SCAN_UNIVERSE))
+    limit = max(1, min(limit, len(tickers), 75))
+    tickers = tickers[:limit]
+
+    filters, labels, requires_sentiment, sort_hint = _parse_scan_filters(query)
+    results = []
+
+    for ticker in tickers:
+        try:
+            snapshot = _build_scan_snapshot(ticker)
+            if not snapshot:
+                continue
+
+            if requires_sentiment:
+                try:
+                    from sentiment_data import get_ticker_sentiment
+                    sentiment = get_ticker_sentiment(ticker)
+                    snapshot["sentiment_score"] = sentiment.get("sentiment_score")
+                    snapshot["sentiment_label"] = sentiment.get("sentiment_label")
+                except Exception:
+                    snapshot["sentiment_score"] = None
+                    snapshot["sentiment_label"] = None
+
+            reasons = []
+            passed = True
+            for predicate in filters:
+                ok, note = predicate(snapshot)
+                if ok and note:
+                    reasons.append(note)
+                if not ok:
+                    passed = False
+                    break
+
+            if not filters:
+                reasons.append("Baseline technical scan (RSI + velocity)")
+
+            if not passed:
+                continue
+
+            # Simple ranking score to surface the most interesting names first
+            score = 0.0
+            rsi_val = snapshot.get("rsi")
+            if rsi_val is not None:
+                score += max(0, (70 - min(rsi_val, 100)) / 100)
+            if snapshot.get("returns_1d") is not None:
+                score += max(0, -snapshot["returns_1d"]) / 200
+            if snapshot.get("sentiment_score") is not None:
+                score += max(0, snapshot["sentiment_score"])
+
+            snapshot["score"] = round(score, 3)
+            snapshot["match_reasons"] = reasons
+            results.append(snapshot)
+        except Exception as e:
+            print(f"Scan failed for {ticker}: {e}")
+            continue
+
+    sort_field, sort_dir = sort_hint
+
+    def sort_key(item: Dict[str, Any]):
+        val = item.get(sort_field)
+        if isinstance(val, (int, float)):
+            return (0, val if sort_dir == "asc" else -val)
+        return (1, 0)
+
+    results.sort(key=sort_key)
+
+    return {
+        "summary": {
+            "query": query,
+            "universe_size": len(tickers),
+            "filters_applied": labels or ["No explicit filters"],
+            "requires_sentiment": requires_sentiment,
+            "matched": len(results),
+            "sort": {"field": sort_field, "direction": sort_dir},
+        },
+        "results": results,
+    }
 
 
 def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
