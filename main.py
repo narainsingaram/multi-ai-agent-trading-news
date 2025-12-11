@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from groq import Groq
 import os
 from dotenv import load_dotenv
@@ -53,6 +53,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "app": "Sigma Trade Terminal API",
+        "docs": "/docs",
+    }
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
 
 # ---------- Agent Prompts ----------
 # These are now more "agentic": each has a clear role, inputs & required outputs.
