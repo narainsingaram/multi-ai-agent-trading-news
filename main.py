@@ -17,11 +17,32 @@ from market_data import (
     scan_chart_patterns,
     scan_market_for_criteria,
 )
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+# AI Learning System imports
+from database import get_db
+from pattern_recognition import get_pattern_recognition
+from recommendation_tracker import get_tracker
+from confidence_calibrator import get_calibrator
+
+# Intelligent Query System imports
+from query_router import get_router, QueryIntent
+from dynamic_scanner import get_scanner
+from quick_response import get_quick_handler
+from enhanced_prompts import (
+    BullAgentOutput,
+    ConsensusAgentOutput,
+    ENHANCED_BULL_PROMPT,
+    ENHANCED_CONSENSUS_PROMPT
+)
+
+# Advanced News Analysis
+from advanced_news_analysis import get_news_analyzer
 
 # ---------- Setup ----------
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+USE_LANGCHAIN_PIPELINE = os.getenv("USE_LANGCHAIN_PIPELINE", "1").lower() not in {"0", "false", "no"}
 
 
 def parse_ticker_list(raw: str) -> List[str]:
@@ -90,7 +111,8 @@ AGENT_PROMPTS = {
         "  \"horizon\": \"scalp|intraday|swing|position|long_term\",\n"
         "  \"tradeable\": \"TRADEABLE|NOT_TRADEABLE\",\n"
         "  \"thesis_summary\": \"...\",\n"
-        "  \"constraints\": [\"...\", \"...\"]\n"
+        "  \"constraints\": [\"...\", \"...\"],\n"
+        "  \"handoff_note\": \"One line for NEWS on what context to gather (drivers, symbols)\"\n"
         "}"
     ),
     "NEWS": (
@@ -113,7 +135,8 @@ AGENT_PROMPTS = {
         "  \"fundamental_take\": {\"valuation\": \"...\", \"quality\": \"...\", \"balance_sheet\": \"...\"},\n"
         "  \"risks\": [\"...\"],\n"
         "  \"trade_implications\": [\"...\"],\n"
-        "  \"sources\": [{\"title\": \"...\", \"publisher\": \"...\", \"url\": \"...\"}]\n"
+        "  \"sources\": [{\"title\": \"...\", \"publisher\": \"...\", \"url\": \"...\"}],\n"
+        "  \"handoff_note\": \"One line for DATA_CONTEXT on key themes/levels to inspect\"\n"
         "}"
     ),
     "DATA_CONTEXT": (
@@ -139,7 +162,8 @@ AGENT_PROMPTS = {
         "  \"support_levels\": [price1, price2],\n"
         "  \"resistance_levels\": [price1, price2],\n"
         "  \"bullish_scenario\": \"...\",\n"
-        "  \"bearish_scenario\": \"...\"\n"
+        "  \"bearish_scenario\": \"...\",\n"
+        "  \"handoff_note\": \"One line for STRATEGY: the clearest setup and decisive levels\"\n"
         "}"
     ),
     "STRATEGY": (
@@ -166,7 +190,8 @@ AGENT_PROMPTS = {
         "  \"exit_logic\": \"Specific exit conditions with real levels\",\n"
         "  \"risk_management\": \"...\",\n"
         "  \"position_sizing_guidelines\": \"...\",\n"
-        "  \"implementation_notes\": [\"...\", \"...\"]\n"
+        "  \"implementation_notes\": [\"...\", \"...\"],\n"
+        "  \"handoff_note\": \"One line for RISK on the biggest vulnerabilities or gaps\"\n"
         "}"
     ),
     "RISK": (
@@ -185,7 +210,8 @@ AGENT_PROMPTS = {
         "    {\"risk\": \"...\", \"mitigation\": \"...\"},\n"
         "    {\"risk\": \"...\", \"mitigation\": \"...\"}\n"
         "  ],\n"
-        "  \"cautious_alternative\": \"...\"\n"
+        "  \"cautious_alternative\": \"...\",\n"
+        "  \"handoff_note\": \"One line for CRITIC on approval vs. required revisions\"\n"
         "}"
     ),
     "CRITIC": (
@@ -199,7 +225,118 @@ AGENT_PROMPTS = {
         "{\n"
         "  \"status\": \"APPROVED|NEEDS_REVISION\",\n"
         "  \"critiques\": [\"...\", \"...\"],\n"
-        "  \"revision_instructions\": \"... or empty string if approved\"\n"
+        "  \"revision_instructions\": \"... or empty string if approved\",\n"
+        "  \"handoff_note\": \"One line for SUMMARY on what to emphasize or adjust\"\n"
+        "}"
+    ),
+    "BULL": (
+        "You are the BULL agent - the optimistic advocate in a trading debate.\n"
+        "Your role: Build the STRONGEST possible bullish case using real data.\n\n"
+        "Given the strategy, market data, and context, you MUST:\n"
+        "1. Identify ALL bullish technical confluences (trend, momentum, volume, institutional support).\n"
+        "2. Highlight positive fundamental catalysts and valuation support.\n"
+        "3. Reference institutional support: Order Blocks, OBV rising, VWAP position, MFI.\n"
+        "4. Cite SPECIFIC price levels and indicator values as evidence (e.g., 'RSI 45', 'VWAP $244.75').\n"
+        "5. Provide 3-5 concrete reasons why THIS is a high-probability long trade.\n"
+        "6. Assign confidence score (0-100) to your bullish thesis based on evidence strength.\n\n"
+        "Be aggressive but evidence-based. Use actual numbers from the data. Don't ignore bearish signals, but explain why bullish factors dominate.\n\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        "  \"thesis\": \"Concise 1-2 sentence bullish argument\",\n"
+        "  \"evidence\": [\"RSI 45 + Stoch oversold = reversal setup\", \"OBV rising 15% = institutional accumulation\", \"ADX 32 = strong uptrend\", ...],\n"
+        "  \"key_levels\": {\"entry\": 245.00, \"target\": 260.00, \"stop\": 240.00},\n"
+        "  \"catalysts\": [\"Earnings beat expected\", \"Bullish Order Block at $242-245\", \"Sector rotation into tech\", ...],\n"
+        "  \"confidence\": 75,\n"
+        "  \"timeframe\": \"3-5 days\",\n"
+        "  \"handoff_note\": \"One line for BEAR on what to challenge\"\n"
+        "}"
+    ),
+    "BEAR": (
+        "You are the BEAR agent - the pessimistic advocate in a trading debate.\n"
+        "Your role: Build the STRONGEST possible bearish case and challenge the BULL's thesis.\n\n"
+        "Given the strategy, market data, Bull's thesis, and context, you MUST:\n"
+        "1. Identify ALL bearish technical signals (overbought, divergences, resistance, distribution).\n"
+        "2. Highlight negative fundamental risks and valuation concerns.\n"
+        "3. Reference distribution signals: OBV falling, MFI overbought, Fair Value Gaps, liquidity pools.\n"
+        "4. DIRECTLY CHALLENGE Bull's evidence with counter-evidence and alternative interpretations.\n"
+        "5. Provide 3-5 concrete reasons why this trade could FAIL or reverse.\n"
+        "6. Assign confidence score (0-100) to your bearish thesis based on evidence strength.\n\n"
+        "Be skeptical and rigorous. Point out what Bull is missing or misinterpreting. Use specific data.\n\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        "  \"thesis\": \"Concise 1-2 sentence bearish argument\",\n"
+        "  \"evidence\": [\"Stoch 85 overbought\", \"Price at FVG resistance $246-248\", \"MFI 72 = distribution\", \"Recent rejection at $252\", ...],\n"
+        "  \"challenges_to_bull\": [\"Bull ignores overbought Stoch - high reversal risk\", \"Bull's OBV rising but MFI shows distribution = divergence\", ...],\n"
+        "  \"key_levels\": {\"short_entry\": 248.00, \"target\": 235.00, \"stop\": 252.00},\n"
+        "  \"risks\": [\"Gap down risk on earnings\", \"Liquidity pool at $253 = stop hunt zone\", \"Sector weakness\", ...],\n"
+        "  \"confidence\": 65,\n"
+        "  \"timeframe\": \"2-4 days\",\n"
+        "  \"handoff_note\": \"One line for DEVILS_ADVOCATE on what both sides missed\"\n"
+        "}"
+    ),
+    "DEVILS_ADVOCATE": (
+        "You are the DEVIL'S ADVOCATE - the critical challenger who finds flaws in ALL arguments.\n"
+        "Your role: Challenge BOTH Bull and Bear. Identify blind spots, biases, and overlooked factors.\n\n"
+        "Given Bull thesis, Bear thesis, and all market data, you MUST:\n"
+        "1. Identify what BOTH Bull and Bear are overlooking, misinterpreting, or cherry-picking.\n"
+        "2. Point out confirmation bias - are they seeing what they want to see?\n"
+        "3. Highlight conflicting signals that neither side adequately addressed.\n"
+        "4. Question assumptions about timeframes, catalysts, support/resistance levels.\n"
+        "5. Suggest alternative interpretations of the same data.\n"
+        "6. Rate the quality of both arguments (0-100) based on evidence rigor and logic.\n\n"
+        "Your job is to make the final decision BETTER by exposing weaknesses. Be ruthlessly objective.\n\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        "  \"bull_weaknesses\": [\"Ignores Stoch overbought signal\", \"Overestimates OBV significance - only 10-day trend\", \"Assumes earnings beat without evidence\", ...],\n"
+        "  \"bear_weaknesses\": [\"Underestimates ADX 32 trend strength\", \"Ignores bullish Order Block support at $242\", \"Overweights short-term overbought\", ...],\n"
+        "  \"overlooked_factors\": [\"Earnings announcement in 3 days = high gap risk\", \"Fed meeting next week\", \"Sector correlation breakdown\", ...],\n"
+        "  \"conflicting_signals\": [\"RSI neutral (55) but Stoch overbought (85)\", \"OBV rising but MFI flat = mixed volume flow\", \"VWAP bullish but FVG resistance ahead\", ...],\n"
+        "  \"bull_argument_quality\": 70,\n"
+        "  \"bear_argument_quality\": 65,\n"
+        "  \"recommendation\": \"Wait for clarity\" | \"Lean bullish\" | \"Lean bearish\" | \"No trade\",\n"
+        "  \"critical_factor\": \"The most important factor both sides should weigh\",\n"
+        "  \"handoff_note\": \"One line for CONSENSUS on what to prioritize in final decision\"\n"
+        "}"
+    ),
+    "CONSENSUS": (
+        "You are the CONSENSUS agent - the final decision synthesizer after debate.\n"
+        "Your role: Weigh Bull, Bear, and Devil's Advocate arguments to reach a balanced, evidence-based decision.\n\n"
+        "Given all debate outputs, market data, and upcoming events, you MUST:\n"
+        "1. Summarize the strongest points from Bull and Bear (2-3 each).\n"
+        "2. Incorporate Devil's Advocate concerns and overlooked factors.\n"
+        "3. Assign weights to Bull and Bear arguments based on evidence quality and Devil's critique.\n"
+        "4. Make a CLEAR directional call: LONG, SHORT, or NO_TRADE.\n"
+        "5. Provide precise entry, target, and stop levels with justification.\n"
+        "6. Give overall confidence score (0-100) reflecting debate outcome.\n"
+        "7. Acknowledge dissenting opinion and conditions that would invalidate the thesis.\n\n"
+        "Be decisive but acknowledge uncertainty. Explain your weighting logic clearly.\n\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        "  \"decision\": \"LONG\" | \"SHORT\" | \"NO_TRADE\",\n"
+        "  \"confidence\": 72,\n"
+        "  \"bull_weight\": 0.60,\n"
+        "  \"bear_weight\": 0.40,\n"
+        "  \"rationale\": \"Bull's institutional accumulation (OBV +15%) and trend strength (ADX 32) outweigh Bear's overbought concerns. However, Fair Value Gap at $248 is valid resistance. Devil's Advocate correctly notes earnings risk in 3 days.\",\n"
+        "  \"recommended_action\": {\n"
+        "    \"entry\": 244.75,\n"
+        "    \"entry_logic\": \"Wait for pullback to VWAP support, don't chase at FVG resistance $246-248\",\n"
+        "    \"target\": 258.00,\n"
+        "    \"target_logic\": \"Next resistance level, conservative given earnings risk\",\n"
+        "    \"stop\": 241.50,\n"
+        "    \"stop_logic\": \"Below bullish Order Block and liquidity pool at $242\",\n"
+        "    \"position_size\": \"50-60% of normal (moderate confidence, earnings risk)\"\n"
+        "  },\n"
+        "  \"key_factors_weighted\": [\n"
+        "    {\"factor\": \"OBV rising (institutional accumulation)\", \"weight\": \"high\", \"direction\": \"bullish\"},\n"
+        "    {\"factor\": \"ADX 32 (strong trend)\", \"weight\": \"high\", \"direction\": \"bullish\"},\n"
+        "    {\"factor\": \"Stoch 85 overbought\", \"weight\": \"medium\", \"direction\": \"bearish\"},\n"
+        "    {\"factor\": \"FVG resistance $246-248\", \"weight\": \"medium\", \"direction\": \"bearish\"},\n"
+        "    {\"factor\": \"Earnings in 3 days\", \"weight\": \"high\", \"direction\": \"risk\"}\n"
+        "  ],\n"
+        "  \"dissenting_view\": \"Bear's overbought Stoch concern is valid for 1-2 day pullback. Short-term traders should wait.\",\n"
+        "  \"invalidation_conditions\": [\"Break below $241 Order Block\", \"Bearish earnings surprise\", \"Stoch bearish crossover with volume spike\"],\n"
+        "  \"timeframe\": \"3-7 days (before earnings)\",\n"
+        "  \"handoff_note\": \"One line for RISK on event-based risks that could invalidate consensus\"\n"
         "}"
     ),
     "STRATEGY_FINAL": (
@@ -218,12 +355,13 @@ AGENT_PROMPTS = {
     ),
     "SUMMARY": (
         "You are the FINAL_SUMMARY agent.\n"
-        "You have the planner, multi-ticker contexts, strategies, final pick, risk, and critic outputs.\n"
+        "You have the planner, multi-ticker contexts, strategies, final pick, Bull vs Bear debate, consensus, risk, and critic outputs.\n"
         "Your job is to write a polished trading plan summary for EDUCATIONAL PURPOSES ONLY.\n\n"
         "Structure it as:\n"
         "- title\n"
         "- thesis\n"
         "- market_context\n"
+        "- debate_summary: Concise summary of Bull case, Bear case, Devil's Advocate concerns, and Consensus decision\n"
         "- strategy (include key technical confluences: EMA/SMA stack, RSI/MACD, VWAP, volume/OBV/MFI, Stoch, ATR, Bollinger, notable patterns/levels)\n"
         "- execution_plan\n"
         "- risk_checklist (bullet list)\n"
@@ -234,6 +372,12 @@ AGENT_PROMPTS = {
         "  \"title\": \"...\",\n"
         "  \"thesis\": \"...\",\n"
         "  \"market_context\": \"...\",\n"
+        "  \"debate_summary\": {\n"
+        "    \"bull_case\": \"2-3 sentence summary of Bull's strongest points\",\n"
+        "    \"bear_case\": \"2-3 sentence summary of Bear's strongest points\",\n"
+        "    \"devils_advocate\": \"1-2 sentence summary of key concerns raised\",\n"
+        "    \"consensus_decision\": \"LONG|SHORT|NO_TRADE with confidence score and rationale\"\n"
+        "  },\n"
         "  \"strategy\": \"...\",\n"
         "  \"execution_plan\": \"...\",\n"
         "  \"risk_checklist\": [\"...\", \"...\"],\n"
@@ -408,17 +552,26 @@ async def run_pipeline(request: Request):
             fundamentals = None
             earnings_events = []
             patterns = []
+            institutional_levels = {}
             try:
                 market_data = get_market_analysis(ticker, period="3mo")
                 fundamentals = market_data.get("fundamentals")
-                market_data_formatted = format_market_data_for_agent(market_data)
                 earnings_events = get_earnings_calendar(ticker)
                 patterns = scan_chart_patterns(ticker, period="6mo")
+                
+                # Get institutional levels
+                from market_data import get_chart_data
+                chart_result = get_chart_data(ticker, period="6mo")
+                if "error" not in chart_result:
+                    institutional_levels = chart_result.get("institutional_levels", {})
+                
+                market_data_formatted = format_market_data_for_agent(market_data, institutional_levels)
             except Exception as e:
                 print(f"Error fetching market data for {ticker}: {e}")
                 market_data_formatted = f"Unable to fetch real market data for {ticker}"
                 earnings_events = []
                 patterns = []
+                institutional_levels = {}
 
             shared_payload["upcoming_events"]["earnings"][ticker] = earnings_events
             shared_payload["pattern_scan"][ticker] = patterns
@@ -481,7 +634,133 @@ async def run_pipeline(request: Request):
         strategy_final_output = await agent_llm_call("STRATEGY_FINAL", comparator_input)
         pipeline_state["strategy_final"] = strategy_final_output
 
-        # ---- 4) RISK on best pick ----
+        # ---- 3.5) BULL vs BEAR DEBATE ----
+        best_strategy = strategy_final_output.get("best_strategy", strategy_final_output) if isinstance(strategy_final_output, dict) else {}
+        
+        # BULL agent - optimistic case
+        bull_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "strategy_final": strategy_final_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
+        }
+        bull_output = await agent_llm_call("BULL", bull_input)
+        pipeline_state["bull"] = bull_output
+
+        # BEAR agent - pessimistic case, challenges Bull
+        bear_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "strategy_final": strategy_final_output,
+            "bull_thesis": bull_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
+        }
+        bear_output = await agent_llm_call("BEAR", bear_input)
+        pipeline_state["bear"] = bear_output
+
+        # DEVILS_ADVOCATE - challenges both Bull and Bear
+        devils_advocate_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "bull_thesis": bull_output,
+            "bear_thesis": bear_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
+        }
+        devils_advocate_output = await agent_llm_call("DEVILS_ADVOCATE", devils_advocate_input)
+        pipeline_state["devils_advocate"] = devils_advocate_output
+
+        # CONSENSUS - synthesizes debate into final recommendation
+        consensus_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "bull_thesis": bull_output,
+            "bear_thesis": bear_output,
+            "devils_advocate": devils_advocate_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": shared_payload["pattern_scan"],
+        }
+        consensus_output = await agent_llm_call("CONSENSUS", consensus_input)
+        pipeline_state["consensus"] = consensus_output
+
+        # Update best_strategy with consensus recommendation
+        if isinstance(consensus_output, dict) and "recommended_action" in consensus_output:
+            best_strategy = consensus_output.get("recommended_action", best_strategy)
+
+        # ---- 3.6) AI LEARNING SYSTEM INTEGRATION ----
+        # Get tracker and calibrator instances
+        tracker = get_tracker()
+        calibrator = get_calibrator()
+        pattern_detector = get_pattern_recognition()
+        
+        # Prepare market data for tracking
+        best_ticker = strategy_final_output.get("best_ticker", effective_tickers[0] if effective_tickers else "UNKNOWN")
+        
+        # Get market data for best ticker
+        try:
+            market_data_for_tracking = get_market_analysis(best_ticker, period="3mo")
+            chart_data = get_chart_data(best_ticker, period="6mo")
+            
+            # Detect patterns in current data
+            if "historical_data" in chart_data and chart_data["historical_data"] is not None:
+                detected_patterns = pattern_detector.detect_all_patterns(chart_data["historical_data"])
+                pipeline_state["detected_patterns"] = detected_patterns
+                
+                print(f"🔍 Detected {len(detected_patterns)} pattern(s) in {best_ticker}")
+                if detected_patterns:
+                    print(f"   Top pattern: {detected_patterns[0]['type']} (quality: {detected_patterns[0].get('quality_score', 0):.2f})")
+            else:
+                detected_patterns = []
+            
+            # Apply confidence calibration to all agents
+            if isinstance(bull_output, dict) and "confidence" in bull_output:
+                original_bull_conf = bull_output["confidence"]
+                bull_output["confidence"] = calibrator.calibrate_confidence("BULL", original_bull_conf)
+                bull_output["original_confidence"] = original_bull_conf
+            
+            if isinstance(bear_output, dict) and "confidence" in bear_output:
+                original_bear_conf = bear_output["confidence"]
+                bear_output["confidence"] = calibrator.calibrate_confidence("BEAR", original_bear_conf)
+                bear_output["original_confidence"] = original_bear_conf
+            
+            if isinstance(consensus_output, dict) and "confidence" in consensus_output:
+                original_consensus_conf = consensus_output["confidence"]
+                consensus_output["confidence"] = calibrator.calibrate_confidence("CONSENSUS", original_consensus_conf)
+                consensus_output["original_confidence"] = original_consensus_conf
+            
+            # Log recommendation to database
+            rec_id = tracker.log_recommendation(
+                pipeline_state=pipeline_state,
+                market_data={
+                    "ticker": best_ticker,
+                    "quote": market_data_for_tracking.get("quote", {}),
+                    "technicals": market_data_for_tracking.get("technicals", {}),
+                    "historical_data": chart_data.get("historical_data"),
+                },
+                ticker=best_ticker
+            )
+            
+            pipeline_state["recommendation_id"] = rec_id
+            pipeline_state["learning_enabled"] = True
+            
+            print(f"✅ AI Learning: Logged recommendation #{rec_id} with {len(detected_patterns)} patterns")
+            
+        except Exception as e:
+            print(f"⚠️  AI Learning integration error: {e}")
+            pipeline_state["learning_enabled"] = False
+            pipeline_state["detected_patterns"] = []
+
+        # ---- 4) RISK on consensus pick ----
         best_strategy = strategy_final_output.get("best_strategy", strategy_final_output) if isinstance(strategy_final_output, dict) else {}
         risk_input = {
             **shared_payload,
@@ -514,6 +793,10 @@ async def run_pipeline(request: Request):
             "data_context": data_outputs,
             "strategies": strategies,
             "strategy_final": strategy_final_output,
+            "bull": bull_output,
+            "bear": bear_output,
+            "devils_advocate": devils_advocate_output,
+            "consensus": consensus_output,
             "risk": risk_output,
             "critic": critic_output,
             "upcoming_events": shared_payload["upcoming_events"],
@@ -557,11 +840,31 @@ async def stream_pipeline(news_text: str | None = None, request: Request = None,
     if not headline and user_tickers:
         headline = f"Multi-ticker analysis for: {', '.join(user_tickers)}"
 
-    from streaming_pipeline import stream_pipeline_events
-    
+    from streaming_pipeline import stream_pipeline_events as legacy_stream
+    langchain_ready = False
+    langchain_stream = None
+    if USE_LANGCHAIN_PIPELINE:
+        try:
+            from langchain_pipeline import (
+                stream_pipeline_events_langchain,
+                LANGCHAIN_READY,
+            )
+
+            langchain_ready = LANGCHAIN_READY
+            if langchain_ready:
+                langchain_stream = stream_pipeline_events_langchain
+        except Exception:
+            langchain_ready = False
+
     async def event_generator():
         try:
-            async for chunk in stream_pipeline_events(headline, user_tickers, user_horizon):
+            chosen_stream = None
+            if USE_LANGCHAIN_PIPELINE and langchain_ready and langchain_stream:
+                chosen_stream = langchain_stream(headline, user_tickers, user_horizon, AGENT_PROMPTS)
+            else:
+                chosen_stream = legacy_stream(headline, user_tickers, user_horizon)
+
+            async for chunk in chosen_stream:
                 # Stop streaming if the client disconnects to avoid socket.send errors
                 if await request.is_disconnected():
                     print("SSE client disconnected; stopping stream.")
@@ -924,7 +1227,669 @@ async def get_ticker_sentiment_endpoint(ticker: str):
         raise HTTPException(status_code=500, detail=f"Failed to fetch ticker sentiment: {str(e)}")
 
 
+# ========== AI LEARNING SYSTEM API ENDPOINTS ==========
 
+@app.get("/api/recommendations/history")
+async def get_recommendations_history(
+    ticker: Optional[str] = None,
+    days: int = 30,
+    outcome: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Get historical recommendations with outcomes.
+    
+    Query params:
+        ticker: Filter by ticker (optional)
+        days: Number of days to look back (default: 30)
+        outcome: Filter by outcome: WIN, LOSS, PENDING, etc. (optional)
+        limit: Max results (default: 100)
+    """
+    try:
+        tracker = get_tracker()
+        history = tracker.db.get_recommendations_history(ticker, days, outcome, limit)
+        
+        # Parse JSON fields
+        for rec in history:
+            if rec.get('technical_snapshot'):
+                try:
+                    rec['technical_snapshot'] = json.loads(rec['technical_snapshot'])
+                except:
+                    pass
+            if rec.get('pattern_detected'):
+                try:
+                    rec['pattern_detected'] = json.loads(rec['pattern_detected'])
+                except:
+                    pass
+        
+        return {
+            "total": len(history),
+            "recommendations": history,
+            "filters": {
+                "ticker": ticker,
+                "days": days,
+                "outcome": outcome
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch recommendations: {str(e)}")
+
+
+@app.get("/api/recommendations/{rec_id}")
+async def get_recommendation_detail(rec_id: int):
+    """Get detailed information about a specific recommendation."""
+    try:
+        tracker = get_tracker()
+        rec = tracker.db.get_recommendation(rec_id)
+        
+        if not rec:
+            raise HTTPException(status_code=404, detail=f"Recommendation #{rec_id} not found")
+        
+        # Parse JSON fields
+        if rec.get('technical_snapshot'):
+            try:
+                rec['technical_snapshot'] = json.loads(rec['technical_snapshot'])
+            except:
+                pass
+        if rec.get('pattern_detected'):
+            try:
+                rec['pattern_detected'] = json.loads(rec['pattern_detected'])
+            except:
+                pass
+        
+        return rec
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch recommendation: {str(e)}")
+
+
+@app.post("/api/recommendations/{rec_id}/update")
+async def update_recommendation_outcome(
+    rec_id: int,
+    actual_exit_price: float,
+    mfe: Optional[float] = None,
+    mae: Optional[float] = None
+):
+    """
+    Update a recommendation with actual outcome.
+    
+    Body:
+        actual_exit_price: Actual exit price
+        mfe: Maximum Favorable Excursion (optional)
+        mae: Maximum Adverse Excursion (optional)
+    """
+    try:
+        tracker = get_tracker()
+        tracker.update_outcome(rec_id, actual_exit_price, mfe=mfe, mae=mae)
+        
+        # Get updated recommendation
+        updated_rec = tracker.db.get_recommendation(rec_id)
+        
+        return {
+            "success": True,
+            "recommendation_id": rec_id,
+            "outcome": updated_rec.get('outcome'),
+            "pnl_percent": updated_rec.get('pnl_percent')
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update recommendation: {str(e)}")
+
+
+@app.get("/api/patterns/library")
+async def get_pattern_library(
+    pattern_type: Optional[str] = None,
+    ticker: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Get pattern library with success rates.
+    
+    Query params:
+        pattern_type: Filter by pattern type (optional)
+        ticker: Filter by ticker (optional)
+        limit: Max results (default: 100)
+    """
+    try:
+        tracker = get_tracker()
+        patterns = tracker.db.get_pattern_library(pattern_type, ticker, limit)
+        
+        # Parse JSON fields
+        for pattern in patterns:
+            if pattern.get('pattern_data'):
+                try:
+                    pattern['pattern_data'] = json.loads(pattern['pattern_data'])
+                except:
+                    pass
+            if pattern.get('technical_context'):
+                try:
+                    pattern['technical_context'] = json.loads(pattern['technical_context'])
+                except:
+                    pass
+        
+        return {
+            "total": len(patterns),
+            "patterns": patterns,
+            "filters": {
+                "pattern_type": pattern_type,
+                "ticker": ticker
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch pattern library: {str(e)}")
+
+
+@app.get("/api/agent/performance")
+async def get_agent_performance(
+    agent_name: str,
+    days: int = 90
+):
+    """
+    Get performance statistics for an agent.
+    
+    Query params:
+        agent_name: Agent name (BULL, BEAR, CONSENSUS, DEVILS_ADVOCATE)
+        days: Number of days to look back (default: 90)
+    """
+    try:
+        if agent_name not in ['BULL', 'BEAR', 'CONSENSUS', 'DEVILS_ADVOCATE']:
+            raise HTTPException(status_code=400, detail="Invalid agent name")
+        
+        tracker = get_tracker()
+        stats = tracker.db.get_agent_stats(agent_name, days)
+        
+        return {
+            "agent_name": agent_name,
+            "period_days": days,
+            "stats": stats
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch agent performance: {str(e)}")
+
+
+@app.get("/api/agent/calibration")
+async def get_agent_calibration(agent_name: str):
+    """
+    Get calibration report for an agent showing confidence accuracy.
+    
+    Query params:
+        agent_name: Agent name (BULL, BEAR, CONSENSUS, DEVILS_ADVOCATE)
+    """
+    try:
+        if agent_name not in ['BULL', 'BEAR', 'CONSENSUS', 'DEVILS_ADVOCATE']:
+            raise HTTPException(status_code=400, detail="Invalid agent name")
+        
+        calibrator = get_calibrator()
+        report = calibrator.get_calibration_report(agent_name)
+        
+        return report
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch calibration report: {str(e)}")
+
+
+@app.post("/api/agent/calibration/update")
+async def update_agent_calibration(agent_name: Optional[str] = None):
+    """
+    Manually trigger calibration update for an agent or all agents.
+    
+    Query params:
+        agent_name: Agent name (optional, updates all if not specified)
+    """
+    try:
+        calibrator = get_calibrator()
+        
+        if agent_name:
+            if agent_name not in ['BULL', 'BEAR', 'CONSENSUS', 'DEVILS_ADVOCATE']:
+                raise HTTPException(status_code=400, detail="Invalid agent name")
+            calibrator.update_calibration(agent_name)
+            return {"success": True, "updated": [agent_name]}
+        else:
+            calibrator.update_all_calibrations()
+            return {"success": True, "updated": ['BULL', 'BEAR', 'CONSENSUS', 'DEVILS_ADVOCATE']}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update calibration: {str(e)}")
+
+
+@app.get("/api/performance/stats")
+async def get_performance_stats(
+    ticker: Optional[str] = None,
+    days: int = 90
+):
+    """
+    Get overall performance statistics.
+    
+    Query params:
+        ticker: Filter by ticker (optional)
+        days: Number of days to look back (default: 90)
+    """
+    try:
+        tracker = get_tracker()
+        stats = tracker.get_performance_stats(ticker, days)
+        
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch performance stats: {str(e)}")
+
+
+@app.get("/api/patterns/detected/{ticker}")
+async def get_detected_patterns(ticker: str, period: str = "6mo"):
+    """
+    Detect patterns in a ticker's chart right now.
+    
+    Path params:
+        ticker: Stock ticker
+    Query params:
+        period: Time period (default: 6mo)
+    """
+    try:
+        pattern_detector = get_pattern_recognition()
+        
+        # Get chart data
+        chart_data = get_chart_data(ticker.upper(), period=period)
+        
+        if "error" in chart_data:
+            raise HTTPException(status_code=404, detail=chart_data["error"])
+        
+        # Detect patterns
+        if "historical_data" in chart_data and chart_data["historical_data"] is not None:
+            patterns = pattern_detector.detect_all_patterns(chart_data["historical_data"])
+            summary = pattern_detector.get_pattern_summary(patterns)
+            
+            return {
+                "ticker": ticker.upper(),
+                "period": period,
+                "patterns_detected": len(patterns),
+                "patterns": patterns,
+                "summary": summary
+            }
+        else:
+            return {
+                "ticker": ticker.upper(),
+                "period": period,
+                "patterns_detected": 0,
+                "patterns": [],
+                "summary": "No chart data available"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to detect patterns: {str(e)}")
+
+
+# ========== INTELLIGENT QUERY ENDPOINT ==========
+
+@app.post("/query")
+async def intelligent_query(request: Request):
+    """
+    Intelligent query endpoint that handles ANY natural language input.
+    Routes queries dynamically based on intent classification.
+    
+    Supported intents:
+    - single_ticker: "Should I buy TSLA?" → Full pipeline
+    - market_scan: "Find oversold tech stocks" → Dynamic scanner
+    - market_overview: "How's the market?" → Quick overview
+    - educational: "What is RSI?" → Educational response
+    - conversational: "Tell me more" → Context-aware response
+    
+    Example requests:
+    {"query": "Should I buy Tesla?"}
+    {"query": "Find me oversold stocks with high volume"}
+    {"query": "What's happening in the market today?"}
+    {"query": "What is the MACD indicator?"}
+    """
+    try:
+        data = await request.json()
+        user_query = data.get("query", "").strip()
+        
+        if not user_query:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        
+        print(f"\n{'='*60}")
+        print(f"🔍 INTELLIGENT QUERY: {user_query}")
+        print(f"{'='*60}\n")
+        
+        # Step 1: Route query using intelligent router
+        router = get_router()
+        routing = router.classify_query(user_query)
+        
+        print(f"📍 Intent: {routing.intent.value}")
+        print(f"📊 Confidence: {routing.confidence:.2f}")
+        print(f"💭 Reasoning: {routing.reasoning}\n")
+        
+        # Step 2: Execute appropriate workflow based on intent
+        
+        if routing.intent == QueryIntent.SINGLE_TICKER:
+            # SINGLE TICKER: Run full pipeline
+            print("→ Routing to FULL PIPELINE\n")
+            
+            tickers = routing.entities.tickers
+            if not tickers:
+                return {
+                    "error": "No ticker found in query",
+                    "suggestion": "Please specify a stock ticker (e.g., 'Should I buy TSLA?')"
+                }
+            
+            # Use first ticker
+            ticker = tickers[0]
+            
+            # Create headline from reformulated query
+            headline = routing.reformulated_query or user_query
+            
+            # Run full pipeline (reuse existing logic)
+            pipeline_data = {
+                "headline": headline,
+                "user_tickers": [ticker]
+            }
+            
+            # Import and run pipeline
+            from main import run_full_pipeline_logic
+            result = await run_full_pipeline_logic(pipeline_data)
+            
+            return {
+                "type": "full_analysis",
+                "intent": routing.intent.value,
+                "ticker": ticker,
+                "result": result
+            }
+        
+        elif routing.intent == QueryIntent.MARKET_SCAN or routing.intent == QueryIntent.CUSTOM_SCAN:
+            # MARKET SCAN: Use dynamic scanner
+            print("→ Routing to DYNAMIC SCANNER\n")
+            
+            scanner = get_scanner()
+            
+            # Parse query into structured criteria
+            criteria = scanner.parse_scan_query(user_query)
+            
+            # Execute scan
+            results = scanner.execute_scan(criteria)
+            
+            return {
+                "type": "scan_results",
+                "intent": routing.intent.value,
+                "query": user_query,
+                "criteria": criteria.dict(),
+                "results_count": len(results),
+                "results": [r.dict() for r in results],
+                "reformulated_query": routing.reformulated_query
+            }
+        
+        elif routing.intent == QueryIntent.MARKET_OVERVIEW:
+            # MARKET OVERVIEW: Quick response
+            print("→ Routing to QUICK OVERVIEW\n")
+            
+            quick_handler = get_quick_handler()
+            response = quick_handler.handle_market_overview()
+            
+            return {
+                "type": "quick_response",
+                "intent": routing.intent.value,
+                "response": response.dict()
+            }
+        
+        elif routing.intent == QueryIntent.EDUCATIONAL:
+            # EDUCATIONAL: Quick educational response
+            print("→ Routing to EDUCATIONAL RESPONSE\n")
+            
+            quick_handler = get_quick_handler()
+            response = quick_handler.handle_educational(user_query)
+            
+            return {
+                "type": "educational",
+                "intent": routing.intent.value,
+                "response": response.dict()
+            }
+        
+        elif routing.intent == QueryIntent.CONVERSATIONAL:
+            # CONVERSATIONAL: Context-aware response
+            print("→ Routing to CONVERSATIONAL RESPONSE\n")
+            
+            quick_handler = get_quick_handler()
+            context = router.get_context()
+            response = quick_handler.handle_follow_up(user_query, context)
+            
+            return {
+                "type": "conversational",
+                "intent": routing.intent.value,
+                "response": response.dict()
+            }
+        
+        else:
+            return {
+                "error": "Intent not yet implemented",
+                "intent": routing.intent.value,
+                "suggestion": "Try asking about a specific stock, market scan, or market overview"
+            }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Query error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+
+
+@app.get("/query/examples")
+async def get_query_examples():
+    """
+    Get example queries for each intent type.
+    Helps users understand what they can ask.
+    """
+    return {
+        "single_ticker": [
+            "Should I buy TSLA?",
+            "Analyze NVDA for potential trade",
+            "Is AAPL a good buy right now?",
+            "MSFT earnings analysis"
+        ],
+        "market_scan": [
+            "Find oversold tech stocks",
+            "Show me stocks breaking out",
+            "Find dividend stocks with good fundamentals",
+            "Stocks with high volume today"
+        ],
+        "custom_scan": [
+            "Find tech stocks with RSI < 30 and bullish MACD",
+            "Show me large cap stocks with P/E under 15",
+            "Dividend stocks with revenue growth > 10%"
+        ],
+        "market_overview": [
+            "How's the market today?",
+            "What's happening in tech sector?",
+            "Market summary",
+            "Is the market bullish or bearish?"
+        ],
+        "educational": [
+            "What is RSI?",
+            "Explain MACD indicator",
+            "How to read Bollinger Bands?",
+            "What are support and resistance levels?"
+        ],
+        "conversational": [
+            "Tell me more about that",
+            "What are the risks?",
+            "Can you explain that in simpler terms?",
+            "What should I do next?"
+        ]
+    }
+
+
+# ========== ADVANCED NEWS ANALYSIS ENDPOINTS ==========
+
+@app.post("/news/analyze")
+async def analyze_news_comprehensive(request: Request):
+    """
+    Comprehensive news analysis endpoint.
+    Pulls from multiple sources and performs deep analysis.
+    
+    Request body:
+    {
+      "ticker": "TSLA",
+      "headline": "Tesla announces record deliveries",  // optional
+      "days_back": 7  // optional, default 7
+    }
+    
+    Returns deep analysis with:
+    - Multi-source news aggregation
+    - Sentiment analysis with confidence
+    - Entity extraction
+    - Management tone analysis
+    - Market-moving insights
+    - Trade implications
+    """
+    try:
+        data = await request.json()
+        ticker = data.get("ticker", "").upper()
+        headline = data.get("headline", f"News analysis for {ticker}")
+        days_back = data.get("days_back", 7)
+        
+        if not ticker:
+            raise HTTPException(status_code=400, detail="ticker is required")
+        
+        print(f"\n{'='*60}")
+        print(f"📰 ADVANCED NEWS ANALYSIS: {ticker}")
+        print(f"{'='*60}\n")
+        
+        # Get news analyzer
+        analyzer = get_news_analyzer()
+        
+        # Step 1: Fetch news from multiple sources
+        print("🔍 Fetching news from multiple sources...")
+        articles = analyzer.fetch_news_multi_source(ticker, headline, days_back)
+        
+        if not articles:
+            return {
+                "ticker": ticker,
+                "error": "No news articles found",
+                "suggestion": "Try increasing days_back or check if ticker is correct"
+            }
+        
+        # Step 2: Get fundamentals for context
+        from market_data import get_market_analysis
+        market_data = get_market_analysis(ticker, period="3mo")
+        fundamentals = market_data.get("fundamentals")
+        
+        # Step 3: Perform deep analysis
+        print("🧠 Performing deep analysis with LLM...")
+        analysis = analyzer.analyze_news_deep(ticker, headline, articles, fundamentals)
+        
+        print(f"\n✅ Analysis complete!")
+        print(f"   Sentiment: {analysis.overall_sentiment} ({analysis.sentiment_score:.2f})")
+        print(f"   Confidence: {analysis.confidence:.2f}")
+        print(f"   Articles analyzed: {analysis.articles_analyzed}")
+        print(f"   Key drivers: {len(analysis.key_drivers)}")
+        print(f"   Entities: {len(analysis.entities_mentioned)}\n")
+        
+        return {
+            "ticker": ticker,
+            "analysis": analysis.dict(),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ News analysis error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"News analysis failed: {str(e)}")
+
+
+@app.get("/news/fetch/{ticker}")
+async def fetch_news_multi_source(ticker: str, days_back: int = 7):
+    """
+    Fetch news from multiple sources without deep analysis.
+    Useful for quick news lookup.
+    
+    Query params:
+    - days_back: Number of days to look back (default: 7)
+    
+    Returns:
+    - List of articles from multiple sources
+    - Deduplication applied
+    - Sorted by relevance and recency
+    """
+    try:
+        ticker = ticker.upper()
+        
+        print(f"📰 Fetching news for {ticker} (last {days_back} days)")
+        
+        analyzer = get_news_analyzer()
+        articles = analyzer.fetch_news_multi_source(ticker, days_back=days_back)
+        
+        return {
+            "ticker": ticker,
+            "articles_count": len(articles),
+            "articles": [a.dict() for a in articles],
+            "sources": list(set([a.source for a in articles])),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch news: {str(e)}")
+
+
+@app.post("/news/sentiment")
+async def analyze_sentiment_only(request: Request):
+    """
+    Quick sentiment analysis without full deep analysis.
+    Faster response time.
+    
+    Request body:
+    {
+      "ticker": "TSLA",
+      "text": "Tesla announces record deliveries beating expectations"
+    }
+    
+    Returns sentiment score and classification.
+    """
+    try:
+        data = await request.json()
+        ticker = data.get("ticker", "").upper()
+        text = data.get("text", "")
+        
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+        
+        # Use LLM for quick sentiment
+        prompt = f"""Analyze the sentiment of this news about {ticker}:
+
+"{text}"
+
+Respond with ONLY valid JSON:
+{{
+  "sentiment": "bullish|bearish|mixed|unclear",
+  "score": <number from -1 to 1>,
+  "confidence": <number from 0 to 1>,
+  "reasoning": "brief explanation"
+}}"""
+        
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=256,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(completion.choices[0].message.content)
+        
+        return {
+            "ticker": ticker,
+            "text": text,
+            "sentiment": result,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {str(e)}")
 
 
 # ---------- Run locally ----------

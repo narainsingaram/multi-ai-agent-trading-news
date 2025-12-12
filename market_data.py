@@ -582,6 +582,17 @@ def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
         df['Volume_SMA_20'] = ta.sma(df['Volume'], length=20)
         df['OBV'] = ta.obv(df['Close'], df['Volume'])
         
+        # VWAP (Volume Weighted Average Price) - institutional benchmark
+        df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+        
+        # MFI (Money Flow Index) - volume-weighted RSI
+        df['MFI_14'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14)
+        
+        # ADX (Average Directional Index) - trend strength
+        adx = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        if adx is not None:
+            df = pd.concat([df, adx], axis=1)
+        
         # Get the latest values
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else latest
@@ -628,6 +639,60 @@ def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
                     elif position < 0.2:
                         bb_position = "lower_band"
         
+        # Stochastic interpretation
+        stoch_signal = "neutral"
+        stoch_k = latest.get('STOCHk_14_3_3')
+        stoch_d = latest.get('STOCHd_14_3_3')
+        if pd.notna(stoch_k) and pd.notna(stoch_d):
+            if stoch_k > 80:
+                stoch_signal = "overbought"
+            elif stoch_k < 20:
+                stoch_signal = "oversold"
+            # Check for crossovers
+            prev_k = prev.get('STOCHk_14_3_3')
+            prev_d = prev.get('STOCHd_14_3_3')
+            if pd.notna(prev_k) and pd.notna(prev_d):
+                if stoch_k > stoch_d and prev_k <= prev_d:
+                    stoch_signal = "bullish_crossover"
+                elif stoch_k < stoch_d and prev_k >= prev_d:
+                    stoch_signal = "bearish_crossover"
+        
+        # OBV trend detection
+        obv_trend = "neutral"
+        if pd.notna(latest['OBV']) and len(df) >= 10:
+            obv_sma = df['OBV'].tail(10).mean()
+            if latest['OBV'] > obv_sma * 1.02:
+                obv_trend = "rising"
+            elif latest['OBV'] < obv_sma * 0.98:
+                obv_trend = "falling"
+        
+        # MFI interpretation
+        mfi_signal = "neutral"
+        mfi = latest.get('MFI_14')
+        if pd.notna(mfi):
+            if mfi > 80:
+                mfi_signal = "overbought"
+            elif mfi < 20:
+                mfi_signal = "oversold"
+        
+        # ADX trend strength
+        adx_strength = "weak"
+        adx_val = latest.get('ADX_14')
+        if pd.notna(adx_val):
+            if adx_val > 25:
+                adx_strength = "strong"
+            elif adx_val > 20:
+                adx_strength = "moderate"
+        
+        # VWAP position
+        vwap_position = "neutral"
+        vwap = latest.get('VWAP')
+        if pd.notna(vwap):
+            if price > vwap * 1.005:
+                vwap_position = "above"
+            elif price < vwap * 0.995:
+                vwap_position = "below"
+        
         return {
             "current_price": float(price),
             "trend": {
@@ -637,6 +702,8 @@ def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
                 "sma_200": float(latest['SMA_200']) if pd.notna(latest['SMA_200']) else None,
                 "ema_12": float(latest['EMA_12']) if pd.notna(latest['EMA_12']) else None,
                 "ema_26": float(latest['EMA_26']) if pd.notna(latest['EMA_26']) else None,
+                "vwap": float(vwap) if pd.notna(vwap) else None,
+                "vwap_position": vwap_position,
             },
             "momentum": {
                 "rsi_14": float(latest['RSI_14']) if pd.notna(latest['RSI_14']) else None,
@@ -645,6 +712,13 @@ def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
                 "macd_signal_line": float(latest.get('MACDs_12_26_9', 0)) if pd.notna(latest.get('MACDs_12_26_9')) else None,
                 "macd_histogram": float(latest.get('MACDh_12_26_9', 0)) if pd.notna(latest.get('MACDh_12_26_9')) else None,
                 "macd_signal": macd_signal,
+                "stochastic_k": float(stoch_k) if pd.notna(stoch_k) else None,
+                "stochastic_d": float(stoch_d) if pd.notna(stoch_d) else None,
+                "stoch_signal": stoch_signal,
+                "mfi_14": float(mfi) if pd.notna(mfi) else None,
+                "mfi_signal": mfi_signal,
+                "adx_14": float(adx_val) if pd.notna(adx_val) else None,
+                "adx_strength": adx_strength,
             },
             "volatility": {
                 "atr_14": float(latest['ATR_14']) if pd.notna(latest['ATR_14']) else None,
@@ -657,6 +731,7 @@ def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
                 "current": int(latest['Volume']),
                 "sma_20": float(latest['Volume_SMA_20']) if pd.notna(latest['Volume_SMA_20']) else None,
                 "obv": float(latest['OBV']) if pd.notna(latest['OBV']) else None,
+                "obv_trend": obv_trend,
                 "volume_trend": "above_average" if latest['Volume'] > latest['Volume_SMA_20'] else "below_average",
             },
             "support_resistance": {
@@ -727,9 +802,10 @@ def get_market_analysis(ticker: str, period: str = "3mo") -> Dict:
     }
 
 
-def format_market_data_for_agent(market_data: Dict) -> str:
+def format_market_data_for_agent(market_data: Dict, institutional_levels: Optional[Dict] = None) -> str:
     """
     Format market data into a readable string for AI agents.
+    Includes institutional levels (Order Blocks, Fair Value Gaps, Liquidity Pools).
     """
     if "error" in market_data:
         return f"Error: {market_data['error']}"
@@ -781,15 +857,52 @@ def format_market_data_for_agent(market_data: Dict) -> str:
         
         output += f"  SMA(20): ${sma_20:.2f}\n" if sma_20 else "  SMA(20): N/A\n"
         output += f"  SMA(50): ${sma_50:.2f}\n" if sma_50 else "  SMA(50): N/A\n"
-        output += f"  SMA(200): ${sma_200:.2f}\n\n" if sma_200 else "  SMA(200): N/A (need 1y+ data)\n\n"
+        output += f"  SMA(200): ${sma_200:.2f}\n" if sma_200 else "  SMA(200): N/A (need 1y+ data)\n"
+        
+        # VWAP (institutional benchmark)
+        vwap = trend.get('vwap')
+        vwap_position = trend.get('vwap_position')
+        if vwap:
+            output += f"  VWAP: ${vwap:.2f} (Price {vwap_position} VWAP)\n"
+        else:
+            output += "  VWAP: N/A\n"
+        
+        output += "\n"
         
         rsi = momentum.get('rsi_14')
         macd = momentum.get('macd')
         macd_signal = momentum.get('macd_signal_line')
+        stoch_k = momentum.get('stochastic_k')
+        stoch_d = momentum.get('stochastic_d')
+        stoch_signal = momentum.get('stoch_signal')
+        mfi = momentum.get('mfi_14')
+        mfi_signal = momentum.get('mfi_signal')
+        adx = momentum.get('adx_14')
+        adx_strength = momentum.get('adx_strength')
         
         output += f"  RSI(14): {rsi:.2f} ({momentum.get('rsi_signal', 'N/A')})\n" if rsi else "  RSI(14): N/A\n"
         output += f"  MACD: {macd:.4f} ({momentum.get('macd_signal', 'N/A')})\n" if macd else "  MACD: N/A\n"
-        output += f"  MACD Signal: {macd_signal:.4f}\n\n" if macd_signal else "  MACD Signal: N/A\n\n"
+        output += f"  MACD Signal: {macd_signal:.4f}\n" if macd_signal else "  MACD Signal: N/A\n"
+        
+        # Stochastic Oscillator
+        if stoch_k and stoch_d:
+            output += f"  Stochastic %K: {stoch_k:.2f}, %D: {stoch_d:.2f} ({stoch_signal})\n"
+        else:
+            output += "  Stochastic: N/A\n"
+        
+        # MFI (Money Flow Index)
+        if mfi:
+            output += f"  MFI(14): {mfi:.2f} ({mfi_signal})\n"
+        else:
+            output += "  MFI(14): N/A\n"
+        
+        # ADX (Trend Strength)
+        if adx:
+            output += f"  ADX(14): {adx:.2f} (Trend Strength: {adx_strength})\n"
+        else:
+            output += "  ADX(14): N/A\n"
+        
+        output += "\n"
         
         bb_upper = volatility.get('bb_upper')
         bb_middle = volatility.get('bb_middle')
@@ -805,7 +918,17 @@ def format_market_data_for_agent(market_data: Dict) -> str:
         
         output += f"  Volume: {volume.get('current', 0):,} ({volume.get('volume_trend', 'N/A')})\n"
         vol_sma = volume.get('sma_20')
-        output += f"  Volume SMA(20): {vol_sma:,.0f}\n\n" if vol_sma else "  Volume SMA(20): N/A\n\n"
+        output += f"  Volume SMA(20): {vol_sma:,.0f}\n" if vol_sma else "  Volume SMA(20): N/A\n"
+        
+        # OBV (On-Balance Volume)
+        obv = volume.get('obv')
+        obv_trend = volume.get('obv_trend')
+        if obv:
+            output += f"  OBV: {obv:,.0f} (Trend: {obv_trend})\n"
+        else:
+            output += "  OBV: N/A\n"
+        
+        output += "\n"
         
         output += f"  Support/Resistance:\n"
         output += f"    Recent High (20d): ${sr.get('recent_high', 0):.2f}\n"
@@ -830,6 +953,31 @@ def format_market_data_for_agent(market_data: Dict) -> str:
         output += f"  ROE: {fundamentals.get('roe', 'N/A')}\n"
         output += f"  Profit Margin: {fundamentals.get('profit_margin', 'N/A')}\n"
         output += f"  Dividend Yield: {fundamentals.get('dividend_yield', 'N/A')}\n"
+
+    # Institutional Levels (Order Blocks, Fair Value Gaps, Liquidity Pools)
+    if institutional_levels:
+        output += "\nInstitutional Levels (Smart Money Zones):\n"
+        
+        # Order Blocks
+        obs = institutional_levels.get('order_blocks', [])
+        if obs:
+            output += "  Order Blocks:\n"
+            for ob in obs[:5]:  # Top 5 most recent
+                output += f"    {ob['type'].title()}: ${ob['bottom']:.2f} - ${ob['top']:.2f} (Date: {ob['date']})\n"
+        
+        # Fair Value Gaps
+        fvgs = institutional_levels.get('fair_value_gaps', [])
+        if fvgs:
+            output += "  Fair Value Gaps (FVG):\n"
+            for fvg in fvgs[:5]:  # Top 5
+                output += f"    {fvg['type'].title()}: ${fvg['bottom']:.2f} - ${fvg['top']:.2f}\n"
+        
+        # Liquidity Pools
+        liq_pools = institutional_levels.get('liquidity_pools', [])
+        if liq_pools:
+            output += "  Liquidity Pools:\n"
+            for pool in liq_pools[:5]:
+                output += f"    {pool['type'].title()}: ${pool['level']:.2f} (Strength: {pool.get('strength', 'N/A')})\n"
 
     # News Headlines
     if news_items:

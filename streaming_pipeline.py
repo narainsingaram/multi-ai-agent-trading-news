@@ -75,16 +75,21 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
             effective_tickers = planner_output.get("tickers", [])
 
         # Pre-fetch market data per ticker (used by downstream agents)
-        from market_data import get_market_analysis, format_market_data_for_agent, get_economic_calendar, get_earnings_calendar, scan_chart_patterns
+        from market_data import get_market_analysis, format_market_data_for_agent, get_economic_calendar, get_earnings_calendar, scan_chart_patterns, get_chart_data
         market_data_bundle = []
         for ticker in effective_tickers[:3]:  # cap for demo safety
             try:
                 market_data_raw = get_market_analysis(ticker, period="3mo")
                 fundamentals = market_data_raw.get("fundamentals")
                 news_articles = market_data_raw.get("news", [])
-                market_data_formatted = format_market_data_for_agent(market_data_raw)
                 earnings_events = get_earnings_calendar(ticker)
                 patterns = scan_chart_patterns(ticker, period="6mo")
+                
+                # Get institutional levels
+                chart_result = get_chart_data(ticker, period="6mo")
+                institutional_levels = chart_result.get("institutional_levels", {}) if "error" not in chart_result else {}
+                
+                market_data_formatted = format_market_data_for_agent(market_data_raw, institutional_levels)
             except Exception as e:
                 market_data_raw = {}
                 fundamentals = None
@@ -92,6 +97,7 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
                 market_data_formatted = f"Unable to fetch market data for {ticker}: {str(e)}"
                 earnings_events = []
                 patterns = []
+                institutional_levels = {}
             market_data_bundle.append({
                 "ticker": ticker,
                 "raw": market_data_raw,
@@ -100,6 +106,7 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
                 "formatted": market_data_formatted,
                 "earnings": earnings_events,
                 "patterns": patterns,
+                "institutional_levels": institutional_levels,
             })
 
         macro_events = get_economic_calendar()
@@ -286,6 +293,169 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
                 })
                 return
 
+        # ---- 5.5) BULL vs BEAR DEBATE ----
+        best_strategy = strategy_final_output.get("best_strategy", strategy_final_output) if isinstance(strategy_final_output, dict) else {}
+        
+        # BULL agent
+        yield format_sse("agent_start", {
+            "agent": "BULL",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        bull_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "strategy_final": strategy_final_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": pipeline_state.get("patterns"),
+        }
+        bull_output = None
+        
+        async for event in agent_llm_call_streaming("BULL", bull_input):
+            if event["type"] == "token":
+                yield format_sse("agent_token", {
+                    "agent": "BULL",
+                    "token": event["content"]
+                })
+            elif event["type"] == "complete":
+                bull_output = event["content"]
+                pipeline_state["bull"] = bull_output
+                yield format_sse("agent_complete", {
+                    "agent": "BULL",
+                    "output": bull_output,
+                    "timestamp": datetime.now().isoformat()
+                })
+            elif event["type"] == "error":
+                yield format_sse("error", {
+                    "agent": "BULL",
+                    "error": event["content"]
+                })
+                return
+
+        # BEAR agent
+        yield format_sse("agent_start", {
+            "agent": "BEAR",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        bear_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "strategy_final": strategy_final_output,
+            "bull_thesis": bull_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": pipeline_state.get("patterns"),
+        }
+        bear_output = None
+        
+        async for event in agent_llm_call_streaming("BEAR", bear_input):
+            if event["type"] == "token":
+                yield format_sse("agent_token", {
+                    "agent": "BEAR",
+                    "token": event["content"]
+                })
+            elif event["type"] == "complete":
+                bear_output = event["content"]
+                pipeline_state["bear"] = bear_output
+                yield format_sse("agent_complete", {
+                    "agent": "BEAR",
+                    "output": bear_output,
+                    "timestamp": datetime.now().isoformat()
+                })
+            elif event["type"] == "error":
+                yield format_sse("error", {
+                    "agent": "BEAR",
+                    "error": event["content"]
+                })
+                return
+
+        # DEVILS_ADVOCATE agent
+        yield format_sse("agent_start", {
+            "agent": "DEVILS_ADVOCATE",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        devils_advocate_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "bull_thesis": bull_output,
+            "bear_thesis": bear_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": pipeline_state.get("patterns"),
+        }
+        devils_advocate_output = None
+        
+        async for event in agent_llm_call_streaming("DEVILS_ADVOCATE", devils_advocate_input):
+            if event["type"] == "token":
+                yield format_sse("agent_token", {
+                    "agent": "DEVILS_ADVOCATE",
+                    "token": event["content"]
+                })
+            elif event["type"] == "complete":
+                devils_advocate_output = event["content"]
+                pipeline_state["devils_advocate"] = devils_advocate_output
+                yield format_sse("agent_complete", {
+                    "agent": "DEVILS_ADVOCATE",
+                    "output": devils_advocate_output,
+                    "timestamp": datetime.now().isoformat()
+                })
+            elif event["type"] == "error":
+                yield format_sse("error", {
+                    "agent": "DEVILS_ADVOCATE",
+                    "error": event["content"]
+                })
+                return
+
+        # CONSENSUS agent
+        yield format_sse("agent_start", {
+            "agent": "CONSENSUS",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        consensus_input = {
+            **shared_payload,
+            "planner": planner_output,
+            "data_context": data_outputs,
+            "strategy": best_strategy,
+            "bull_thesis": bull_output,
+            "bear_thesis": bear_output,
+            "devils_advocate": devils_advocate_output,
+            "upcoming_events": shared_payload["upcoming_events"],
+            "pattern_scan": pipeline_state.get("patterns"),
+        }
+        consensus_output = None
+        
+        async for event in agent_llm_call_streaming("CONSENSUS", consensus_input):
+            if event["type"] == "token":
+                yield format_sse("agent_token", {
+                    "agent": "CONSENSUS",
+                    "token": event["content"]
+                })
+            elif event["type"] == "complete":
+                consensus_output = event["content"]
+                pipeline_state["consensus"] = consensus_output
+                yield format_sse("agent_complete", {
+                    "agent": "CONSENSUS",
+                    "output": consensus_output,
+                    "timestamp": datetime.now().isoformat()
+                })
+            elif event["type"] == "error":
+                yield format_sse("error", {
+                    "agent": "CONSENSUS",
+                    "error": event["content"]
+                })
+                return
+
+        # Update best_strategy with consensus recommendation
+        if isinstance(consensus_output, dict) and "recommended_action" in consensus_output:
+            best_strategy = consensus_output.get("recommended_action", best_strategy)
+
         # ---- 6) RISK ----
         yield format_sse("agent_start", {
             "agent": "RISK",
@@ -378,6 +548,10 @@ async def stream_pipeline_events(headline: str, user_tickers: List[str] | None =
             "data_context": data_outputs,
             "strategies": strategies,
             "strategy_final": strategy_final_output,
+            "bull": bull_output,
+            "bear": bear_output,
+            "devils_advocate": devils_advocate_output,
+            "consensus": consensus_output,
             "risk": risk_output,
             "critic": critic_output,
             "fundamentals": market_data_bundle[0]["fundamentals"] if market_data_bundle else None,
