@@ -5,8 +5,146 @@ Fetches real options chain data from yfinance and calculates metrics.
 
 import yfinance as yf
 import pandas as pd
+import requests
+from requests.exceptions import RequestException
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
+
+
+YAHOO_OPTIONS_URL = "https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+
+
+def _safe_series_sum(df: pd.DataFrame, column: str) -> float:
+    """Sum a dataframe column safely even if it's missing or contains NaNs."""
+    if df is None or df.empty:
+        return 0
+    series = df.get(column)
+    if series is None:
+        return 0
+    return float(pd.to_numeric(series.fillna(0), errors="coerce").sum())
+
+
+def _fetch_options_via_http(ticker: str, expiration_date: Optional[str] = None):
+    """Hit Yahoo's options endpoint directly to avoid yfinance curl/DNS issues."""
+    params = {}
+    if expiration_date:
+        try:
+            params["date"] = int(datetime.strptime(expiration_date, "%Y-%m-%d").timestamp())
+        except ValueError:
+            raise ValueError(f"Invalid expiration format: {expiration_date}. Expected YYYY-MM-DD.")
+
+    try:
+        resp = requests.get(
+            YAHOO_OPTIONS_URL.format(ticker=ticker),
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except RequestException as e:
+        raise RuntimeError(f"HTTP fetch failed: {e}") from e
+    except ValueError as e:
+        raise RuntimeError(f"Invalid response while parsing options JSON: {e}") from e
+
+    chain_results = payload.get("optionChain", {}).get("result") or []
+    if not chain_results:
+        raise RuntimeError("No option chain returned from Yahoo Finance.")
+
+    chain = chain_results[0]
+    expiration_stamps = chain.get("expirationDates") or []
+    available_expirations = [
+        datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+        for ts in expiration_stamps
+    ]
+
+    options_list = chain.get("options") or []
+    if not options_list:
+        raise RuntimeError("No options data available for the requested expiration.")
+
+    option_set = options_list[0]
+    exp_timestamp = option_set.get("expirationDate")
+    exp_date = (
+        datetime.utcfromtimestamp(exp_timestamp).strftime("%Y-%m-%d")
+        if exp_timestamp
+        else (available_expirations[0] if available_expirations else None)
+    )
+
+    quote = (option_set.get("quote") or chain.get("quote")) or {}
+    current_price = (
+        quote.get("regularMarketPrice")
+        or quote.get("postMarketPrice")
+        or quote.get("preMarketPrice")
+        or quote.get("lastPrice")
+    )
+
+    calls_df = pd.DataFrame(option_set.get("calls") or [])
+    puts_df = pd.DataFrame(option_set.get("puts") or [])
+
+    return calls_df, puts_df, current_price, exp_date, available_expirations
+
+
+def _build_options_payload(
+    ticker: str,
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    current_price: float,
+    exp_date: str,
+    expirations: List[str],
+) -> Dict[str, Any]:
+    """Convert raw calls/puts dataframes into the API response shape."""
+    if current_price is None:
+        return {"error": f"Could not fetch current price for {ticker}"}
+
+    # Ensure required columns exist for aggregation
+    calls = calls.copy()
+    puts = puts.copy()
+    for df in (calls, puts):
+        if "volume" not in df:
+            df["volume"] = 0
+        if "openInterest" not in df:
+            df["openInterest"] = 0
+
+    calls_data = process_options_data(calls, current_price, 'call')
+    puts_data = process_options_data(puts, current_price, 'put')
+
+    total_call_volume = _safe_series_sum(calls, "volume")
+    total_put_volume = _safe_series_sum(puts, "volume")
+    total_call_oi = _safe_series_sum(calls, "openInterest")
+    total_put_oi = _safe_series_sum(puts, "openInterest")
+
+    pc_ratio_volume = total_put_volume / total_call_volume if total_call_volume > 0 else 0
+    pc_ratio_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+
+    unusual_calls = detect_unusual_activity(calls_data)
+    unusual_puts = detect_unusual_activity(puts_data)
+    heatmap_data = create_heatmap_data(calls_data, puts_data, current_price)
+
+    return {
+        "ticker": ticker,
+        "current_price": float(current_price),
+        "expiration_date": exp_date,
+        "available_expirations": list(expirations or []),
+        "calls": calls_data,
+        "puts": puts_data,
+        "put_call_ratio": {
+            "volume": float(pc_ratio_volume),
+            "open_interest": float(pc_ratio_oi)
+        },
+        "total_volume": {
+            "calls": int(total_call_volume),
+            "puts": int(total_put_volume)
+        },
+        "total_open_interest": {
+            "calls": int(total_call_oi),
+            "puts": int(total_put_oi)
+        },
+        "unusual_activity": {
+            "calls": unusual_calls,
+            "puts": unusual_puts
+        },
+        "heatmap": heatmap_data
+    }
 
 
 def get_options_chain(ticker: str, expiration_date: Optional[str] = None) -> Dict[str, Any]:
@@ -20,85 +158,60 @@ def get_options_chain(ticker: str, expiration_date: Optional[str] = None) -> Dic
     Returns:
         Dictionary with options chain data, put/call ratios, and unusual activity
     """
+    errors: List[str] = []
+
+    # First try direct HTTP call to avoid yfinance DNS/consent failures (e.g., guce.yahoo.com).
+    try:
+        calls_df, puts_df, current_price, exp_date, expirations = _fetch_options_via_http(
+            ticker, expiration_date
+        )
+        payload = _build_options_payload(
+            ticker,
+            calls_df,
+            puts_df,
+            current_price,
+            exp_date,
+            expirations,
+        )
+        if "error" not in payload:
+            return payload
+        errors.append(payload["error"])
+    except Exception as e:
+        errors.append(f"Yahoo HTTP fallback failed: {e}")
+
     try:
         stock = yf.Ticker(ticker)
-        
-        # Get available expiration dates
-        expirations = stock.options
+        expirations = list(stock.options or [])
         if not expirations:
-            return {"error": f"No options data available for {ticker}"}
-        
-        # Use specified expiration or nearest one
-        if expiration_date and expiration_date in expirations:
-            exp_date = expiration_date
+            errors.append(f"No options data available for {ticker}")
         else:
-            exp_date = expirations[0]  # Nearest expiration
-        
-        # Fetch options chain
-        opt_chain = stock.option_chain(exp_date)
-        calls = opt_chain.calls
-        puts = opt_chain.puts
-        
-        # Get current stock price
-        current_price = stock.info.get('currentPrice') or stock.info.get('regularMarketPrice')
-        if not current_price:
-            # Fallback: get from recent history
-            hist = stock.history(period='1d')
-            current_price = hist['Close'].iloc[-1] if not hist.empty else None
-        
-        if current_price is None:
-            return {"error": f"Could not fetch current price for {ticker}"}
-        
-        # Process calls
-        calls_data = process_options_data(calls, current_price, 'call')
-        
-        # Process puts
-        puts_data = process_options_data(puts, current_price, 'put')
-        
-        # Calculate put/call ratios
-        total_call_volume = calls['volume'].sum()
-        total_put_volume = puts['volume'].sum()
-        total_call_oi = calls['openInterest'].sum()
-        total_put_oi = puts['openInterest'].sum()
-        
-        pc_ratio_volume = total_put_volume / total_call_volume if total_call_volume > 0 else 0
-        pc_ratio_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-        
-        # Detect unusual activity
-        unusual_calls = detect_unusual_activity(calls_data)
-        unusual_puts = detect_unusual_activity(puts_data)
-        
-        # Create strike price heatmap data
-        heatmap_data = create_heatmap_data(calls_data, puts_data, current_price)
-        
-        return {
-            "ticker": ticker,
-            "current_price": float(current_price),
-            "expiration_date": exp_date,
-            "available_expirations": list(expirations),
-            "calls": calls_data,
-            "puts": puts_data,
-            "put_call_ratio": {
-                "volume": float(pc_ratio_volume),
-                "open_interest": float(pc_ratio_oi)
-            },
-            "total_volume": {
-                "calls": int(total_call_volume),
-                "puts": int(total_put_volume)
-            },
-            "total_open_interest": {
-                "calls": int(total_call_oi),
-                "puts": int(total_put_oi)
-            },
-            "unusual_activity": {
-                "calls": unusual_calls,
-                "puts": unusual_puts
-            },
-            "heatmap": heatmap_data
-        }
-        
+            exp_date = expiration_date if expiration_date in expirations else expirations[0]
+
+            opt_chain = stock.option_chain(exp_date)
+            calls = opt_chain.calls
+            puts = opt_chain.puts
+
+            current_price = stock.info.get('currentPrice') or stock.info.get('regularMarketPrice')
+            if not current_price:
+                hist = stock.history(period='1d')
+                current_price = hist['Close'].iloc[-1] if not hist.empty else None
+
+            payload = _build_options_payload(
+                ticker,
+                calls,
+                puts,
+                current_price,
+                exp_date,
+                expirations,
+            )
+            if "error" not in payload:
+                return payload
+            errors.append(payload["error"])
     except Exception as e:
-        return {"error": f"Failed to fetch options data: {str(e)}"}
+        errors.append(f"yfinance fallback failed: {e}")
+
+    detail = "; ".join(errors) if errors else "Unknown error"
+    return {"error": f"Failed to fetch options data: {detail}"}
 
 
 def process_options_data(df: pd.DataFrame, current_price: float, option_type: str) -> List[Dict]:
